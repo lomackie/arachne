@@ -3,3 +3,8 @@
 /.beads/
 /.claude/
 /CLAUDE.md
+
+
+# Added by cargo
+
+/target

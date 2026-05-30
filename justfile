@@ -1,5 +1,6 @@
 cluster := "arachne-dev"
 kubeconfig := justfile_directory() / "dev/kubeconfig"
+image := "arachne:dev"
 
 default:
     @just --list
@@ -12,7 +13,6 @@ check:
 
 up: check
     kind create cluster --config dev/kind-cluster.yaml --kubeconfig {{kubeconfig}}
-    @echo "export KUBECONFIG={{kubeconfig}}"
 
 down:
     -kind delete cluster --name {{cluster}}
@@ -20,7 +20,13 @@ down:
 
 recreate: down up
 
-install:
+build:
+    docker build -t {{image}} .
+
+load: build
+    kind load docker-image {{image}} --name {{cluster}}
+
+install: load
     KUBECONFIG={{kubeconfig}} kubectl apply -f deploy/arachne-installer.yaml
 
 uninstall:
@@ -28,10 +34,3 @@ uninstall:
 
 reload:
     KUBECONFIG={{kubeconfig}} kubectl rollout restart daemonset/arachne -n kube-system
-
-status:
-    KUBECONFIG={{kubeconfig}} kubectl get nodes -o wide
-    KUBECONFIG={{kubeconfig}} kubectl -n kube-system get pods -l app=arachne -o wide
-
-logs:
-    KUBECONFIG={{kubeconfig}} kubectl -n kube-system logs -l app=arachne --all-containers -f --max-log-requests=10

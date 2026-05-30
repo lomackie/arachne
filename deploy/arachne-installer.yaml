@@ -17,30 +17,32 @@ spec:
         - operator: Exists
       initContainers:
         - name: install-cni
-          image: busybox:1.36
+          image: arachne:dev
+          imagePullPolicy: Never
           securityContext: { privileged: true }
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
+              cp /usr/local/bin/arachne /host/opt/cni/bin/arachne
               cat > /host/etc/cni/net.d/10-arachne.conflist <<'EOF'
               {
-                "cniVersion": "1.0.0",
+                "cniVersion": "1.1.0",
                 "name": "arachne",
                 "plugins": [
                   { "type": "arachne" }
                 ]
               }
               EOF
-              echo "arachne CNI config installed"
           volumeMounts:
             - { name: cni-bin, mountPath: /host/opt/cni/bin }
             - { name: cni-cfg, mountPath: /host/etc/cni/net.d }
       containers:
         - name: agent
-          image: busybox:1.36
+          image: arachne:dev
+          imagePullPolicy: Never
           securityContext: { privileged: true }
-          command: ["/bin/sh", "-c", "echo arachne agent stub; sleep infinity"]
+          command: ["/bin/sh", "-c", "sleep infinity"]
           volumeMounts:
             - { name: bpffs, mountPath: /sys/fs/bpf, mountPropagation: Bidirectional }
             - { name: cgroup, mountPath: /sys/fs/cgroup }
