@@ -13,6 +13,8 @@ pub enum CniError {
     UnsupportedVersion(String),
     #[error("IPAM error: {0}")]
     Ipam(String),
+    #[error("network setup error: {0}")]
+    Netlink(String),
 }
 
 impl CniError {
@@ -23,6 +25,7 @@ impl CniError {
             CniError::Io(_) => 5,
             CniError::Json(_) => 6,
             CniError::Ipam(_) => 11,
+            CniError::Netlink(_) => 100,
         }
     }
 }

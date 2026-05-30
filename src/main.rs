@@ -47,6 +47,8 @@ fn cmd_add(params: &CniParams, config: &NetworkConfig) -> Result<(), CniError> {
 
     let alloc = cni::ipam::allocate(&net, container_id)?;
 
+    cni::veth::setup(container_id, &ifname, &netns, alloc.address, alloc.prefix_len, alloc.gateway)?;
+
     let result = CniResult {
         cni_version: CNI_VERSION.to_string(),
         interfaces: vec![
@@ -71,6 +73,7 @@ fn cmd_add(params: &CniParams, config: &NetworkConfig) -> Result<(), CniError> {
 fn cmd_del(params: &CniParams) -> Result<(), CniError> {
     let container_id = params.container_id.as_deref()
         .ok_or_else(|| CniError::InvalidEnv("missing CNI_CONTAINERID".into()))?;
+    cni::veth::teardown(container_id)?;
     cni::ipam::release(container_id)
 }
 
