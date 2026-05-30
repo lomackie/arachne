@@ -5,6 +5,10 @@ use nix::sched::CloneFlags;
 use rtnetlink::Handle;
 use super::error::CniError;
 
+pub fn host_veth_name(container_id: &str) -> String {
+    format!("veth{}", &container_id[..container_id.len().min(8)])
+}
+
 pub fn setup(
     container_id: &str,
     ifname: &str,
@@ -43,9 +47,8 @@ async fn setup_async(
         return Err(CniError::Netlink("IPv6 not supported".into()));
     };
 
-    let suffix = &container_id[..container_id.len().min(8)];
-    let host_veth = format!("veth{suffix}");
-    let peer_veth = format!("peth{suffix}");
+    let host_veth = host_veth_name(container_id);
+    let peer_veth = format!("peth{}", &container_id[..container_id.len().min(8)]);
 
     let (connection, handle, _) = rtnetlink::new_connection()
         .map_err(|e| CniError::Netlink(e.to_string()))?;
@@ -128,8 +131,7 @@ async fn configure_pod_netns(
 }
 
 async fn teardown_async(container_id: &str) -> Result<(), CniError> {
-    let suffix = &container_id[..container_id.len().min(8)];
-    let host_veth = format!("veth{suffix}");
+    let host_veth = host_veth_name(container_id);
 
     let (connection, handle, _) = rtnetlink::new_connection()
         .map_err(|e| CniError::Netlink(e.to_string()))?;

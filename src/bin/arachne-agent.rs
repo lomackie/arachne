@@ -17,6 +17,8 @@ async fn main() -> Result<()> {
     let client = Client::try_default().await.context("failed to create Kubernetes client")?;
 
     let pod_cidr = fetch_pod_cidr(&client, &node_name).await?;
+    arachne::bpf::ensure_bpffs().context("failed to mount bpffs")?;
+    arachne::bpf::attach_node("eth0").context("failed to attach TC to eth0")?;
     write_conflist(&pod_cidr).context("failed to write conflist")?;
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

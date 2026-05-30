@@ -1,4 +1,4 @@
-mod cni;
+use arachne::{bpf, cni};
 
 use ipnet::IpNet;
 use cni::{CniError, CniErrorResponse, CniParams, Command, Interface, IpConfig, NetworkConfig, CniResult, Route};
@@ -48,6 +48,7 @@ fn cmd_add(params: &CniParams, config: &NetworkConfig) -> Result<(), CniError> {
     let alloc = cni::ipam::allocate(&net, container_id)?;
 
     cni::veth::setup(container_id, &ifname, &netns, alloc.address, alloc.prefix_len, alloc.gateway)?;
+    bpf::attach_pod(&cni::veth::host_veth_name(container_id), container_id)?;
 
     let result = CniResult {
         cni_version: CNI_VERSION.to_string(),
@@ -74,6 +75,7 @@ fn cmd_del(params: &CniParams) -> Result<(), CniError> {
     let container_id = params.container_id.as_deref()
         .ok_or_else(|| CniError::InvalidEnv("missing CNI_CONTAINERID".into()))?;
     cni::veth::teardown(container_id)?;
+    bpf::detach_pod(container_id)?;
     cni::ipam::release(container_id)
 }
 
