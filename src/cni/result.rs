@@ -13,6 +13,7 @@ pub struct CniResult {
 #[derive(Serialize)]
 pub struct Interface {
     pub name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub mac: String,
     pub sandbox: String,
 }

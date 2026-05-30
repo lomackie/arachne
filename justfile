@@ -34,3 +34,9 @@ uninstall:
 
 reload:
     KUBECONFIG={{kubeconfig}} kubectl rollout restart daemonset/arachne -n kube-system
+
+test:
+    cargo test
+
+test-e2e:
+    KUBECONFIG={{kubeconfig}} dev/e2e.sh

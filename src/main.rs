@@ -4,7 +4,6 @@ use ipnet::IpNet;
 use cni::{CniError, CniErrorResponse, CniParams, Command, Interface, IpConfig, NetworkConfig, CniResult, Route};
 
 const CNI_VERSION: &str = "1.1.0";
-const SUPPORTED_VERSIONS: &[&str] = &["0.4.0", "1.0.0", "1.1.0"];
 
 fn run() -> Result<(), CniError> {
     let params = CniParams::from_env()?;
@@ -12,66 +11,67 @@ fn run() -> Result<(), CniError> {
     if params.command == Command::Version {
         let resp = serde_json::json!({
             "cniVersion": CNI_VERSION,
-            "supportedVersions": SUPPORTED_VERSIONS,
+            "supportedVersions": [CNI_VERSION],
         });
         println!("{resp}");
         return Ok(());
     }
 
     let config = NetworkConfig::from_stdin()?;
+    if config.cni_version != CNI_VERSION {
+        return Err(CniError::UnsupportedVersion(config.cni_version));
+    }
 
     match params.command {
-        Command::Add => {
-            let container_id = params.container_id
-                .ok_or_else(|| CniError::InvalidEnv("missing CNI_CONTAINERID".into()))?;
-            let ifname = params.ifname
-                .ok_or_else(|| CniError::InvalidEnv("missing CNI_IFNAME".into()))?;
-            let netns = params.netns
-                .ok_or_else(|| CniError::InvalidEnv("missing CNI_NETNS".into()))?;
-            let subnet = config.subnet
-                .ok_or_else(|| CniError::InvalidEnv("missing subnet in config".into()))?;
-
-            let net: IpNet = subnet.parse()
-                .map_err(|_| CniError::Ipam(format!("invalid subnet: {subnet}")))?;
-            let gateway = net.hosts().next()
-                .ok_or_else(|| CniError::Ipam("subnet too small".into()))?;
-
-            let ip = cni::ipam::allocate(&subnet, &container_id)?;
-
-            let result = CniResult {
-                cni_version: CNI_VERSION.to_string(),
-                interfaces: vec![
-                    Interface { name: ifname, mac: String::new(), sandbox: netns },
-                ],
-                ips: vec![
-                    IpConfig {
-                        address: format!("{}/{}", ip, net.prefix_len()),
-                        gateway,
-                        interface: 0,
-                    },
-                ],
-                routes: vec![
-                    Route { dst: "0.0.0.0/0".to_string(), gw: gateway },
-                ],
-            };
-
-            println!("{}", serde_json::to_string(&result)?);
-            Ok(())
-        }
-        Command::Del => {
-            todo!("DEL: tear down pod networking")
-        }
-        Command::Check => {
-            todo!("CHECK: verify pod networking is as expected")
-        }
-        Command::Gc => {
-            todo!("GC: clean up stale attachments")
-        }
-        Command::Status => {
-            todo!("STATUS: report plugin readiness")
-        }
+        Command::Add => cmd_add(&params, &config),
+        Command::Del => cmd_del(&params),
+        Command::Check => todo!("CHECK: verify pod networking is as expected"),
+        Command::Gc => todo!("GC: clean up stale attachments"),
+        Command::Status => Ok(()),
         Command::Version => unreachable!(),
     }
+}
+
+fn cmd_add(params: &CniParams, config: &NetworkConfig) -> Result<(), CniError> {
+    let container_id = params.container_id.as_deref()
+        .ok_or_else(|| CniError::InvalidEnv("missing CNI_CONTAINERID".into()))?;
+    let ifname = params.ifname.clone()
+        .ok_or_else(|| CniError::InvalidEnv("missing CNI_IFNAME".into()))?;
+    let netns = params.netns.clone()
+        .ok_or_else(|| CniError::InvalidEnv("missing CNI_NETNS".into()))?;
+    let subnet = config.subnet.as_deref()
+        .ok_or_else(|| CniError::InvalidEnv("missing subnet in config".into()))?;
+
+    let net: IpNet = subnet.parse()
+        .map_err(|_| CniError::Ipam(format!("invalid subnet: {subnet}")))?;
+
+    let alloc = cni::ipam::allocate(&net, container_id)?;
+
+    let result = CniResult {
+        cni_version: CNI_VERSION.to_string(),
+        interfaces: vec![
+            Interface { name: ifname, mac: String::new(), sandbox: netns },
+        ],
+        ips: vec![
+            IpConfig {
+                address: format!("{}/{}", alloc.address, alloc.prefix_len),
+                gateway: alloc.gateway,
+                interface: 0,
+            },
+        ],
+        routes: vec![
+            Route { dst: "0.0.0.0/0".to_string(), gw: alloc.gateway },
+        ],
+    };
+
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+fn cmd_del(params: &CniParams) -> Result<(), CniError> {
+    let container_id = params.container_id.as_deref()
+        .ok_or_else(|| CniError::InvalidEnv("missing CNI_CONTAINERID".into()))?;
+    cni::ipam::release(container_id)
 }
 
 fn main() {

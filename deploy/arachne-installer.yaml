@@ -41,7 +41,6 @@ spec:
     spec:
       serviceAccountName: arachne
       hostNetwork: true
-      hostPID: true
       tolerations:
         - operator: Exists
       initContainers:

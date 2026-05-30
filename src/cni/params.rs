@@ -67,3 +67,23 @@ impl CniParams {
         Ok(CniParams { command, container_id, netns, ifname, args, path })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_known_commands() {
+        assert_eq!("ADD".parse::<Command>().unwrap(), Command::Add);
+        assert_eq!("DEL".parse::<Command>().unwrap(), Command::Del);
+        assert_eq!("CHECK".parse::<Command>().unwrap(), Command::Check);
+        assert_eq!("VERSION".parse::<Command>().unwrap(), Command::Version);
+        assert_eq!("GC".parse::<Command>().unwrap(), Command::Gc);
+        assert_eq!("STATUS".parse::<Command>().unwrap(), Command::Status);
+    }
+
+    #[test]
+    fn rejects_unknown_command() {
+        assert!("FROBNICATE".parse::<Command>().is_err());
+    }
+}
