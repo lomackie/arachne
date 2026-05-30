@@ -1,0 +1,5 @@
+/dev/kubeconfig
+/.direnv/
+/.beads/
+/.claude/
+/CLAUDE.md

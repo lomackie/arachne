@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: arachne
+  namespace: kube-system
+  labels: { app: arachne }
+spec:
+  selector:
+    matchLabels: { app: arachne }
+  template:
+    metadata:
+      labels: { app: arachne }
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: install-cni
+          image: busybox:1.36
+          securityContext: { privileged: true }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cat > /host/etc/cni/net.d/10-arachne.conflist <<'EOF'
+              {
+                "cniVersion": "1.0.0",
+                "name": "arachne",
+                "plugins": [
+                  { "type": "arachne" }
+                ]
+              }
+              EOF
+              echo "arachne CNI config installed"
+          volumeMounts:
+            - { name: cni-bin, mountPath: /host/opt/cni/bin }
+            - { name: cni-cfg, mountPath: /host/etc/cni/net.d }
+      containers:
+        - name: agent
+          image: busybox:1.36
+          securityContext: { privileged: true }
+          command: ["/bin/sh", "-c", "echo arachne agent stub; sleep infinity"]
+          volumeMounts:
+            - { name: bpffs, mountPath: /sys/fs/bpf, mountPropagation: Bidirectional }
+            - { name: cgroup, mountPath: /sys/fs/cgroup }
+      volumes:
+        - { name: cni-bin, hostPath: { path: /opt/cni/bin, type: DirectoryOrCreate } }
+        - { name: cni-cfg, hostPath: { path: /etc/cni/net.d, type: DirectoryOrCreate } }
+        - { name: bpffs,   hostPath: { path: /sys/fs/bpf,    type: DirectoryOrCreate } }
+        - { name: cgroup,  hostPath: { path: /sys/fs/cgroup, type: Directory } }
