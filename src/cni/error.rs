@@ -11,6 +11,8 @@ pub enum CniError {
     Json(#[from] serde_json::Error),
     #[error("unsupported CNI version: {0}")]
     UnsupportedVersion(String),
+    #[error("IPAM error: {0}")]
+    Ipam(String),
 }
 
 impl CniError {
@@ -20,6 +22,7 @@ impl CniError {
             CniError::InvalidEnv(_) => 4,
             CniError::Io(_) => 5,
             CniError::Json(_) => 6,
+            CniError::Ipam(_) => 11,
         }
     }
 }

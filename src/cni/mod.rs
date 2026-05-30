@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub mod ipam;
 pub mod params;
 
 pub use config::NetworkConfig;

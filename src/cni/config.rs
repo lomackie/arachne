@@ -9,6 +9,7 @@ pub struct NetworkConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub type_: String,
+    pub subnet: Option<String>,
     #[serde(rename = "prevResult")]
     pub prev_result: Option<serde_json::Value>,
     #[serde(flatten)]
