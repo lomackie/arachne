@@ -1,6 +1,7 @@
 mod cni;
 
-use cni::{CniError, CniErrorResponse, CniParams, Command, NetworkConfig};
+use ipnet::IpNet;
+use cni::{CniError, CniErrorResponse, CniParams, Command, Interface, IpConfig, NetworkConfig, CniResult, Route};
 
 const CNI_VERSION: &str = "1.1.0";
 const SUPPORTED_VERSIONS: &[&str] = &["0.4.0", "1.0.0", "1.1.0"];
@@ -21,7 +22,41 @@ fn run() -> Result<(), CniError> {
 
     match params.command {
         Command::Add => {
-            todo!("ADD: set up pod networking")
+            let container_id = params.container_id
+                .ok_or_else(|| CniError::InvalidEnv("missing CNI_CONTAINERID".into()))?;
+            let ifname = params.ifname
+                .ok_or_else(|| CniError::InvalidEnv("missing CNI_IFNAME".into()))?;
+            let netns = params.netns
+                .ok_or_else(|| CniError::InvalidEnv("missing CNI_NETNS".into()))?;
+            let subnet = config.subnet
+                .ok_or_else(|| CniError::InvalidEnv("missing subnet in config".into()))?;
+
+            let net: IpNet = subnet.parse()
+                .map_err(|_| CniError::Ipam(format!("invalid subnet: {subnet}")))?;
+            let gateway = net.hosts().next()
+                .ok_or_else(|| CniError::Ipam("subnet too small".into()))?;
+
+            let ip = cni::ipam::allocate(&subnet, &container_id)?;
+
+            let result = CniResult {
+                cni_version: CNI_VERSION.to_string(),
+                interfaces: vec![
+                    Interface { name: ifname, mac: String::new(), sandbox: netns },
+                ],
+                ips: vec![
+                    IpConfig {
+                        address: format!("{}/{}", ip, net.prefix_len()),
+                        gateway,
+                        interface: 0,
+                    },
+                ],
+                routes: vec![
+                    Route { dst: "0.0.0.0/0".to_string(), gw: gateway },
+                ],
+            };
+
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
         }
         Command::Del => {
             todo!("DEL: tear down pod networking")
