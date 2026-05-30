@@ -13,9 +13,11 @@ async fn main() -> Result<()> {
     let pod_cidr = fetch_pod_cidr(&client, &node_name).await?;
     write_conflist(&pod_cidr).context("failed to write conflist")?;
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    }
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?
+        .recv()
+        .await;
+    Ok(())
 }
 
 async fn fetch_pod_cidr(client: &Client, node_name: &str) -> Result<String> {

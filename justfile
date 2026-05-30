@@ -32,7 +32,7 @@ install: load
 uninstall:
     -KUBECONFIG={{kubeconfig}} kubectl delete -f deploy/arachne-installer.yaml
 
-reload:
+reload: install
     KUBECONFIG={{kubeconfig}} kubectl rollout restart daemonset/arachne -n kube-system
 
 test:
