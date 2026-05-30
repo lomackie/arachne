@@ -38,5 +38,5 @@ reload:
 test:
     cargo test
 
-test-e2e:
-    KUBECONFIG={{kubeconfig}} dev/e2e.sh
+e2e:
+    KUBECONFIG={{kubeconfig}} uv run --with-requirements dev/requirements.txt pytest dev/e2e_test.py -v

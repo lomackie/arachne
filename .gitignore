@@ -3,6 +3,7 @@
 /.beads/
 /.claude/
 /CLAUDE.md
+*__pycache__
 
 
 # Added by cargo
