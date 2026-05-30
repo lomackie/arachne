@@ -38,5 +38,8 @@ reload: install
 test:
     cargo test
 
+verify-ebpf:
+    sudo -E env "PATH=$PATH" cargo test ebpf_verifier_accepts -- --nocapture
+
 e2e:
     KUBECONFIG={{kubeconfig}} uv run --with-requirements dev/requirements.txt pytest dev/e2e_test.py -v

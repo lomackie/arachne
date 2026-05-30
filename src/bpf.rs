@@ -92,10 +92,39 @@ fn attach(ifname: &str, pin_path: &Path, direction: TcAttachType) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::EBPF_BYTES;
-    use aya::Ebpf;
+    use aya::{Ebpf, programs::SchedClassifier};
 
     #[test]
     fn ebpf_bytes_parse() {
         Ebpf::load(EBPF_BYTES).expect("aya failed to parse embedded eBPF ELF");
+    }
+
+    #[test]
+    fn ebpf_verifier_accepts() {
+        let mut ebpf = Ebpf::load(EBPF_BYTES).expect("aya failed to parse embedded eBPF ELF");
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut("tc_forward")
+            .expect("tc_forward not found")
+            .try_into()
+            .expect("expected SchedClassifier");
+        if let Err(e) = prog.load() {
+            let mut src: Option<&dyn std::error::Error> = Some(&e);
+            let is_perm = loop {
+                match src {
+                    None => break false,
+                    Some(s) => {
+                        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                            break io.kind() == std::io::ErrorKind::PermissionDenied;
+                        }
+                        src = s.source();
+                    }
+                }
+            };
+            if is_perm {
+                eprintln!("skipping: CAP_BPF not available");
+                return;
+            }
+            panic!("kernel verifier rejected tc_forward: {e}");
+        }
     }
 }
