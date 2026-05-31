@@ -41,6 +41,7 @@ name = "arachne"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arachne-common",
  "aya",
  "futures",
  "ipnet",
@@ -54,6 +55,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "arachne-common"
+version = "0.1.0"
+dependencies = [
+ "aya",
 ]
 
 [[package]]

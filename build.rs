@@ -33,4 +33,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=arachne-ebpf/src");
     println!("cargo:rerun-if-changed=arachne-ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=arachne-common/src");
+    println!("cargo:rerun-if-changed=arachne-common/Cargo.toml");
 }

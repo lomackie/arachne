@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use aya::{
-    Ebpf, include_bytes_aligned,
+    EbpfLoader, include_bytes_aligned,
     programs::{links::FdLink, SchedClassifier, TcAttachType},
 };
 use anyhow::Result;
@@ -61,7 +61,9 @@ pub fn detach_pod(container_id: &str) -> Result<(), CniError> {
 fn attach(ifname: &str, pin_path: &Path, direction: TcAttachType) -> Result<()> {
     std::fs::create_dir_all(PIN_DIR)?;
 
-    let mut ebpf = Ebpf::load(EBPF_BYTES)
+    let mut ebpf = EbpfLoader::new()
+        .map_pin_path(PIN_DIR)
+        .load(EBPF_BYTES)
         .map_err(|e| anyhow::anyhow!("load eBPF program: {e}"))?;
 
     let prog: &mut SchedClassifier = ebpf
