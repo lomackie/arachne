@@ -106,10 +106,25 @@ def _busybox_pod(name, node_name):
 def _delete_pods(core_v1, *names):
     for name in names:
         try:
-            core_v1.delete_namespaced_pod(name, NAMESPACE)
+            core_v1.delete_namespaced_pod(
+                name, NAMESPACE,
+                body=client.V1DeleteOptions(grace_period_seconds=0),
+            )
         except ApiException as e:
             if e.status != 404:
                 raise
+
+    def all_gone():
+        for name in names:
+            try:
+                core_v1.read_namespaced_pod(name, NAMESPACE)
+                return None
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+        return True
+
+    _wait(all_gone)
 
 
 def test_same_node_pod_routing(core_v1):
@@ -118,6 +133,7 @@ def test_same_node_pod_routing(core_v1):
     node_name = workers[0].metadata.name
 
     pod_a, pod_b = "arachne-e2e-a", "arachne-e2e-b"
+    _delete_pods(core_v1, pod_a, pod_b)
     core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(pod_a, node_name))
     core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(pod_b, node_name))
 
@@ -180,6 +196,7 @@ def test_cross_node_pod_routing(core_v1):
     node_a, node_b = workers[0].metadata.name, workers[1].metadata.name
     pod_a, pod_b = "arachne-e2e-xnode-a", "arachne-e2e-xnode-b"
 
+    _delete_pods(core_v1, pod_a, pod_b)
     core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(pod_a, node_a))
     core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(pod_b, node_b))
 
@@ -200,17 +217,89 @@ def test_cross_node_pod_routing(core_v1):
         _delete_pods(core_v1, pod_a, pod_b)
 
 
+CLUSTER_NAME = "arachne-dev"
+
+
+def _spin_up_node(node_name):
+    """Start a new kind worker node and join it to the cluster."""
+    donor = f"{CLUSTER_NAME}-worker"
+    image = subprocess.check_output(
+        ["docker", "inspect", "--format", "{{.Config.Image}}", donor]
+    ).decode().strip()
+
+    # Copy kubeadm.conf from an existing worker — it already has the cluster
+    # CA, API server endpoint, and token baked in.
+    subprocess.run(["docker", "cp", f"{donor}:/kind/kubeadm.conf", f"/tmp/{node_name}.conf"], check=True)
+    with open(f"/tmp/{node_name}.conf") as f:
+        conf = f.read()
+
+    # Run the new node container with the same flags kind uses.
+    subprocess.run([
+        "docker", "run", "-d", "--privileged", "--tty", "--init=false",
+        "--name", node_name, "--hostname", node_name,
+        "--network", "kind",
+        "--label", f"io.x-k8s.kind.cluster={CLUSTER_NAME}",
+        "--label", "io.x-k8s.kind.role=worker",
+        "--security-opt", "seccomp=unconfined",
+        "--security-opt", "apparmor=unconfined",
+        "--tmpfs", "/tmp", "--tmpfs", "/run",
+        "--volume", "/var",
+        "--volume", "/lib/modules:/lib/modules:ro",
+        image,
+    ], check=True)
+
+    new_ip = subprocess.check_output([
+        "docker", "inspect", "--format",
+        "{{(index .NetworkSettings.Networks \"kind\").IPAddress}}", node_name,
+    ]).decode().strip()
+
+    # Patch the donor's IP and hostname to match the new node.
+    donor_ip = subprocess.check_output([
+        "docker", "inspect", "--format",
+        "{{(index .NetworkSettings.Networks \"kind\").IPAddress}}", donor,
+    ]).decode().strip()
+    conf = conf.replace(donor_ip, new_ip).replace(donor, node_name)
+    with open(f"/tmp/{node_name}.conf", "w") as f:
+        f.write(conf)
+
+    subprocess.run(["docker", "cp", f"/tmp/{node_name}.conf", f"{node_name}:/kind/kubeadm.conf"], check=True)
+
+    # Wait for containerd to be ready before joining.
+    _wait(lambda: subprocess.run(
+        ["docker", "exec", node_name, "systemctl", "is-active", "--quiet", "containerd"],
+        capture_output=True,
+    ).returncode == 0 or None)
+
+    # Load the agent image so the DaemonSet pod doesn't hit ErrImageNeverPull.
+    save = subprocess.Popen(["docker", "save", "arachne:dev"], stdout=subprocess.PIPE)
+    subprocess.run(
+        ["docker", "exec", "-i", node_name, "ctr", "-n", "k8s.io", "images", "import", "-"],
+        stdin=save.stdout, check=True,
+    )
+    save.stdout.close()
+    save.wait()
+
+    subprocess.run([
+        "docker", "exec", node_name,
+        "kubeadm", "join", "--config", "/kind/kubeadm.conf", "--skip-phases=preflight",
+    ], check=True)
+
+
+def _tear_down_node(core_v1, node_name):
+    """Remove a node from the cluster and delete its container."""
+    try:
+        core_v1.delete_node(node_name)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+    subprocess.run(["docker", "rm", "-f", node_name], check=False)
+
+
 def test_node_route_lifecycle(core_v1):
-    """Routes disappear when a node leaves and reappear when it rejoins."""
+    """Routes appear when a node joins and disappear when it leaves."""
     nodes = core_v1.list_node().items
     workers = [n for n in nodes if "node-role.kubernetes.io/control-plane" not in (n.metadata.labels or {})]
-    assert len(workers) >= 2, "need at least 2 worker nodes"
-
-    # target: the node we'll remove; observer: the node whose route table we'll check.
-    target = workers[-1]
     observer = workers[0]
-    target_cidr = target.spec.pod_cidr
-    assert target_cidr, f"node {target.metadata.name} has no podCIDR"
 
     observer_agent = next(
         p for p in core_v1.list_namespaced_pod("kube-system", label_selector="app=arachne").items
@@ -225,38 +314,20 @@ def test_node_route_lifecycle(core_v1):
             stderr=True, stdin=False, stdout=True, tty=False,
         )
 
-    def restart_kubelet():
-        subprocess.run(
-            ["docker", "exec", target.metadata.name, "systemctl", "restart", "kubelet"],
-            check=True,
-        )
-
-    assert target_cidr in route_output(), f"route for {target_cidr} not present before test"
-
-    core_v1.delete_node(target.metadata.name)
-
+    new_node = "arachne-e2e-lifecycle"
+    _spin_up_node(new_node)
+    new_cidr = None
     try:
-        _wait(lambda: target_cidr not in route_output() or None)
-
-        restart_kubelet()
-
-        # Wait for the node to re-register and get a CIDR assigned (may differ from
-        # the original if the IPAM controller reassigns from the pool).
-        def node_rejoined():
+        def node_has_cidr():
             try:
-                n = core_v1.read_node(target.metadata.name)
-                return n.spec.pod_cidr or None
+                return core_v1.read_node(new_node).spec.pod_cidr or None
             except ApiException as e:
                 if e.status == 404:
                     return None
                 raise
-
-        new_cidr = _wait(node_rejoined)
+        new_cidr = _wait(node_has_cidr)
         _wait(lambda: new_cidr in route_output() or None)
-
     finally:
-        try:
-            core_v1.read_node(target.metadata.name)
-        except ApiException as e:
-            if e.status == 404:
-                restart_kubelet()
+        _tear_down_node(core_v1, new_node)
+        if new_cidr:
+            _wait(lambda: new_cidr not in route_output() or None)

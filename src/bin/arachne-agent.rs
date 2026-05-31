@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
+use std::time::Duration;
 use ipnet::Ipv4Net;
 use k8s_openapi::api::core::v1::Node;
 use kube::runtime::watcher::{self, Event};
@@ -24,10 +25,24 @@ async fn main() -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
 
-    tokio::select! {
-        _ = sigterm.recv() => {},
-        res = watch_node_routes(&client, &node_name) => {
-            res.context("node route watcher failed")?;
+    let mut counter_tick = tokio::time::interval(Duration::from_secs(30));
+    counter_tick.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => break,
+            res = watch_node_routes(&client, &node_name) => {
+                res.context("node route watcher failed")?;
+            }
+            _ = counter_tick.tick() => {
+                match arachne::bpf::read_counters() {
+                    Ok(c) => eprintln!(
+                        "counters: map_hit={} fib_miss={} redirect={}",
+                        c.map_hit, c.fib_miss, c.redirect
+                    ),
+                    Err(e) => eprintln!("counters: read failed: {e}"),
+                }
+            }
         }
     }
     Ok(())
@@ -48,13 +63,17 @@ async fn watch_node_routes(client: &Client, my_node: &str) -> Result<()> {
                 let Some(name) = node.metadata.name.as_deref() else { continue };
                 if name == my_node { continue }
 
-                let node_ip = node_internal_ip(&node);
-                let cidr_str = node.spec.and_then(|s| s.pod_cidr);
-                let (Some(cidr_str), Some(node_ip)) = (cidr_str, node_ip) else { continue };
-
+                let Some(cidr_str) = node.spec.as_ref().and_then(|s| s.pod_cidr.as_deref()) else { continue };
                 let net: Ipv4Net = cidr_str.parse().context("invalid podCIDR")?;
-                upsert_route(&handle, net, node_ip).await
-                    .with_context(|| format!("upsert route {net} via {node_ip}"))?;
+
+                if node_is_ready(&node) {
+                    let Some(node_ip) = node_internal_ip(&node) else { continue };
+                    upsert_route(&handle, net, node_ip).await
+                        .with_context(|| format!("upsert route {net} via {node_ip}"))?;
+                } else {
+                    delete_route(&handle, net).await
+                        .with_context(|| format!("delete route for NotReady node {name}: {net}"))?;
+                }
             }
             Event::Delete(node) => {
                 let Some(cidr_str) = node.spec.and_then(|s| s.pod_cidr) else { continue };
@@ -66,6 +85,13 @@ async fn watch_node_routes(client: &Client, my_node: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn node_is_ready(node: &Node) -> bool {
+    node.status.as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|conds| conds.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+        .unwrap_or(false)
 }
 
 fn node_internal_ip(node: &Node) -> Option<Ipv4Addr> {

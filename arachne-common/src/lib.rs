@@ -5,6 +5,11 @@ use core::net::Ipv4Addr;
 pub const ENDPOINTS_MAP: &str = "ENDPOINTS";
 pub const MAX_ENDPOINTS: u32 = 1 << 16;
 
+pub const COUNTER_MAP_HIT: u32 = 0;
+pub const COUNTER_FIB_MISS: u32 = 1;
+pub const COUNTER_REDIRECT: u32 = 2;
+pub const COUNTER_MAX: u32 = 3;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Endpoint {

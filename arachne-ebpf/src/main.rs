@@ -3,18 +3,23 @@
 
 use core::ffi::c_long;
 
-use arachne_common::{Endpoint, MAX_ENDPOINTS};
+use arachne_common::{
+    COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_MAX, COUNTER_REDIRECT, Endpoint, MAX_ENDPOINTS,
+};
 use aya_ebpf::{
     EbpfContext,
-    bindings::{TC_ACT_OK, __sk_buff, bpf_fib_lookup as BpfFibLookup},
+    bindings::{__sk_buff, TC_ACT_OK, bpf_fib_lookup as BpfFibLookup},
     helpers::{bpf_fib_lookup, bpf_redirect},
     macros::{classifier, map},
-    maps::HashMap,
+    maps::{HashMap, PerCpuArray},
     programs::TcContext,
 };
 
 #[map]
 static ENDPOINTS: HashMap<u32, Endpoint> = HashMap::pinned(MAX_ENDPOINTS, 0);
+
+#[map]
+static COUNTERS: PerCpuArray<u64> = PerCpuArray::pinned(COUNTER_MAX, 0);
 
 // Ethernet header: 6 dst + 6 src + 2 type = 14 bytes
 const ETH_HLEN: usize = 14;
@@ -22,6 +27,13 @@ const ETH_HLEN: usize = 14;
 const ETH_P_IP: u16 = 0x0800;
 // AF_INET
 const AF_INET: u8 = 2;
+
+#[inline(always)]
+fn bump(index: u32) {
+    if let Some(ptr) = COUNTERS.get_ptr_mut(index) {
+        unsafe { *ptr += 1 };
+    }
+}
 
 #[classifier]
 pub fn tc_forward(mut ctx: TcContext) -> i32 {
@@ -42,6 +54,7 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
     if let Some(endpoint) = unsafe { ENDPOINTS.get(&ip_dst) } {
         let endpoint = unsafe { &*endpoint };
         ctx.store(0, &endpoint.mac, 0)?;
+        bump(COUNTER_MAP_HIT);
         return Ok(unsafe { bpf_redirect(endpoint.ifindex, 0) } as i32);
     }
 
@@ -63,6 +76,7 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
 
     // BPF_FIB_LKUP_RET_SUCCESS == 0; anything else means miss or unresolved neighbour
     if rc != 0 {
+        bump(COUNTER_FIB_MISS);
         return Ok(TC_ACT_OK as i32);
     }
 
@@ -70,6 +84,7 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
     ctx.store(0, &fib.dmac, 0)?;
     ctx.store(6, &fib.smac, 0)?;
 
+    bump(COUNTER_REDIRECT);
     // Hand the packet to the kernel redirect machinery
     Ok(unsafe { bpf_redirect(fib.ifindex, 0) } as i32)
 }

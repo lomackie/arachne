@@ -3,13 +3,15 @@ use std::path::{Path, PathBuf};
 
 use aya::{
     EbpfLoader, include_bytes_aligned,
-    maps::{HashMap, Map, MapData},
+    maps::{HashMap, Map, MapData, PerCpuArray, PerCpuValues},
     programs::{links::FdLink, SchedClassifier, TcAttachType},
 };
 use anyhow::Result;
 use nix::mount::MsFlags;
 
-use arachne_common::{Endpoint, ENDPOINTS_MAP, endpoint_key};
+use arachne_common::{
+    COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_REDIRECT, Endpoint, ENDPOINTS_MAP, endpoint_key,
+};
 use crate::cni::CniError;
 
 static EBPF_BYTES: &[u8] = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/arachne-ebpf"));
@@ -109,6 +111,26 @@ pub fn endpoints_insert(pod_ip: Ipv4Addr, ifindex: u32, mac: [u8; 6]) -> Result<
     let mut map = open_endpoints_map()?;
     map.insert(endpoint_key(pod_ip), Endpoint { ifindex, mac }, 0)
         .map_err(|e| CniError::Netlink(format!("insert ENDPOINTS entry: {e}")))
+}
+
+pub struct Counters {
+    pub map_hit: u64,
+    pub fib_miss: u64,
+    pub redirect: u64,
+}
+
+pub fn read_counters() -> Result<Counters> {
+    let path = format!("{PIN_DIR}/COUNTERS");
+    let map_data = MapData::from_pin(&path)?;
+    let map: PerCpuArray<_, u64> = PerCpuArray::try_from(Map::PerCpuArray(map_data))?;
+
+    let sum = |vals: PerCpuValues<u64>| vals.iter().sum::<u64>();
+
+    Ok(Counters {
+        map_hit: sum(map.get(&COUNTER_MAP_HIT, 0)?),
+        fib_miss: sum(map.get(&COUNTER_FIB_MISS, 0)?),
+        redirect: sum(map.get(&COUNTER_REDIRECT, 0)?),
+    })
 }
 
 pub fn endpoints_remove(pod_ip: Ipv4Addr) -> Result<(), CniError> {
