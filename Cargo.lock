@@ -68,6 +68,7 @@ dependencies = [
 name = "arachne-ebpf"
 version = "0.1.0"
 dependencies = [
+ "arachne-common",
  "aya-ebpf",
 ]
 

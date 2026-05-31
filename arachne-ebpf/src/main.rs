@@ -3,13 +3,18 @@
 
 use core::ffi::c_long;
 
+use arachne_common::{Endpoint, MAX_ENDPOINTS};
 use aya_ebpf::{
     EbpfContext,
     bindings::{TC_ACT_OK, __sk_buff, bpf_fib_lookup as BpfFibLookup},
     helpers::{bpf_fib_lookup, bpf_redirect},
-    macros::classifier,
+    macros::{classifier, map},
+    maps::HashMap,
     programs::TcContext,
 };
+
+#[map]
+static ENDPOINTS: HashMap<u32, Endpoint> = HashMap::pinned(MAX_ENDPOINTS, 0);
 
 // Ethernet header: 6 dst + 6 src + 2 type = 14 bytes
 const ETH_HLEN: usize = 14;
@@ -33,6 +38,12 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
     // IPv4 saddr is at IP header offset 12, daddr at offset 16
     let ip_src = ctx.load::<u32>(ETH_HLEN + 12)?;
     let ip_dst = ctx.load::<u32>(ETH_HLEN + 16)?;
+
+    if let Some(endpoint) = unsafe { ENDPOINTS.get(&ip_dst) } {
+        let endpoint = unsafe { &*endpoint };
+        ctx.store(0, &endpoint.mac, 0)?;
+        return Ok(unsafe { bpf_redirect(endpoint.ifindex, 0) } as i32);
+    }
 
     let mut fib: BpfFibLookup = unsafe { core::mem::zeroed() };
     fib.family = AF_INET;

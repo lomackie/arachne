@@ -16,7 +16,7 @@ pub fn setup(
     pod_ip: IpAddr,
     prefix_len: u8,
     gateway: IpAddr,
-) -> Result<(), CniError> {
+) -> Result<(u32, [u8; 6]), CniError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -39,7 +39,7 @@ async fn setup_async(
     pod_ip: IpAddr,
     prefix_len: u8,
     gateway: IpAddr,
-) -> Result<(), CniError> {
+) -> Result<(u32, [u8; 6]), CniError> {
     let IpAddr::V4(pod_ipv4) = pod_ip else {
         return Err(CniError::Netlink("IPv6 not supported".into()));
     };
@@ -92,7 +92,8 @@ async fn setup_async(
     nix::sched::setns(&host_ns, CloneFlags::CLONE_NEWNET)
         .map_err(|e| CniError::Netlink(format!("return to host netns: {e}")))?;
 
-    result
+    let pod_mac = result?;
+    Ok((host_idx, pod_mac))
 }
 
 async fn configure_pod_netns(
@@ -101,7 +102,7 @@ async fn configure_pod_netns(
     pod_ip: Ipv4Addr,
     prefix_len: u8,
     gateway: Ipv4Addr,
-) -> Result<(), CniError> {
+) -> Result<[u8; 6], CniError> {
     let (conn2, handle2, _) = rtnetlink::new_connection()
         .map_err(|e| CniError::Netlink(e.to_string()))?;
     tokio::spawn(conn2);
@@ -127,7 +128,25 @@ async fn configure_pod_netns(
         .await
         .map_err(|e| CniError::Netlink(format!("add default route: {e}")))?;
 
-    Ok(())
+    link_mac(&handle2, ifname).await
+}
+
+async fn link_mac(handle: &Handle, name: &str) -> Result<[u8; 6], CniError> {
+    use netlink_packet_route::link::LinkAttribute;
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    let link = links.try_next().await
+        .map_err(|e| CniError::Netlink(format!("get link {name}: {e}")))?
+        .ok_or_else(|| CniError::Netlink(format!("link not found: {name}")))?;
+    link.attributes.iter().find_map(|attr| {
+        if let LinkAttribute::Address(addr) = attr {
+            if addr.len() == 6 {
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(addr);
+                return Some(mac);
+            }
+        }
+        None
+    }).ok_or_else(|| CniError::Netlink(format!("no MAC on {name}")))
 }
 
 async fn teardown_async(container_id: &str) -> Result<(), CniError> {

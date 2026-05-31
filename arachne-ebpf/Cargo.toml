@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 aya-ebpf = "0.1"
+arachne-common = { path = "../arachne-common", default-features = false }
 
 [[bin]]
 name = "arachne-ebpf"

@@ -1,12 +1,15 @@
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use aya::{
     EbpfLoader, include_bytes_aligned,
+    maps::{HashMap, Map, MapData},
     programs::{links::FdLink, SchedClassifier, TcAttachType},
 };
 use anyhow::Result;
 use nix::mount::MsFlags;
 
+use arachne_common::{Endpoint, ENDPOINTS_MAP, endpoint_key};
 use crate::cni::CniError;
 
 static EBPF_BYTES: &[u8] = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/arachne-ebpf"));
@@ -60,6 +63,9 @@ pub fn detach_pod(container_id: &str) -> Result<(), CniError> {
 
 fn attach(ifname: &str, pin_path: &Path, direction: TcAttachType) -> Result<()> {
     std::fs::create_dir_all(PIN_DIR)?;
+    if pin_path.exists() {
+        std::fs::remove_file(pin_path)?;
+    }
 
     let mut ebpf = EbpfLoader::new()
         .map_pin_path(PIN_DIR)
@@ -91,38 +97,74 @@ fn attach(ifname: &str, pin_path: &Path, direction: TcAttachType) -> Result<()> 
     Ok(())
 }
 
+fn open_endpoints_map() -> Result<HashMap<MapData, u32, Endpoint>, CniError> {
+    let path = format!("{PIN_DIR}/{ENDPOINTS_MAP}");
+    let map_data = MapData::from_pin(&path)
+        .map_err(|e| CniError::Netlink(format!("open ENDPOINTS map: {e}")))?;
+    HashMap::try_from(Map::HashMap(map_data))
+        .map_err(|e| CniError::Netlink(format!("open ENDPOINTS map: {e}")))
+}
+
+pub fn endpoints_insert(pod_ip: Ipv4Addr, ifindex: u32, mac: [u8; 6]) -> Result<(), CniError> {
+    let mut map = open_endpoints_map()?;
+    map.insert(endpoint_key(pod_ip), Endpoint { ifindex, mac }, 0)
+        .map_err(|e| CniError::Netlink(format!("insert ENDPOINTS entry: {e}")))
+}
+
+pub fn endpoints_remove(pod_ip: Ipv4Addr) -> Result<(), CniError> {
+    let mut map = open_endpoints_map()?;
+    map.remove(&endpoint_key(pod_ip))
+        .map_err(|e| CniError::Netlink(format!("remove ENDPOINTS entry: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::EBPF_BYTES;
     use aya::{Ebpf, programs::SchedClassifier};
 
+    fn is_perm_denied(e: &(dyn std::error::Error + 'static)) -> bool {
+        let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+        loop {
+            match src {
+                None => return false,
+                Some(s) => {
+                    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                        return io.kind() == std::io::ErrorKind::PermissionDenied;
+                    }
+                    src = s.source();
+                }
+            }
+        }
+    }
+
+    fn try_load() -> Option<Ebpf> {
+        match Ebpf::load(EBPF_BYTES) {
+            Ok(ebpf) => Some(ebpf),
+            Err(e) => {
+                if is_perm_denied(&e) {
+                    eprintln!("skipping: CAP_BPF not available");
+                    return None;
+                }
+                panic!("aya failed to parse embedded eBPF ELF: {e}");
+            }
+        }
+    }
+
     #[test]
     fn ebpf_bytes_parse() {
-        Ebpf::load(EBPF_BYTES).expect("aya failed to parse embedded eBPF ELF");
+        try_load();
     }
 
     #[test]
     fn ebpf_verifier_accepts() {
-        let mut ebpf = Ebpf::load(EBPF_BYTES).expect("aya failed to parse embedded eBPF ELF");
+        let Some(mut ebpf) = try_load() else { return };
         let prog: &mut SchedClassifier = ebpf
             .program_mut("tc_forward")
             .expect("tc_forward not found")
             .try_into()
             .expect("expected SchedClassifier");
         if let Err(e) = prog.load() {
-            let mut src: Option<&dyn std::error::Error> = Some(&e);
-            let is_perm = loop {
-                match src {
-                    None => break false,
-                    Some(s) => {
-                        if let Some(io) = s.downcast_ref::<std::io::Error>() {
-                            break io.kind() == std::io::ErrorKind::PermissionDenied;
-                        }
-                        src = s.source();
-                    }
-                }
-            };
-            if is_perm {
+            if is_perm_denied(&e) {
                 eprintln!("skipping: CAP_BPF not available");
                 return;
             }

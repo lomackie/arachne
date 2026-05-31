@@ -16,6 +16,15 @@ pub fn allocate(net: &IpNet, container_id: &str) -> Result<Allocation, CniError>
     allocate_in(Path::new(DATA_DIR), net, container_id)
 }
 
+pub fn lookup(container_id: &str) -> Result<Option<IpAddr>, CniError> {
+    let path = Path::new(DATA_DIR).join("by-container").join(container_id);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(s.trim().parse().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CniError::Io(e)),
+    }
+}
+
 pub fn release(container_id: &str) -> Result<(), CniError> {
     release_in(Path::new(DATA_DIR), container_id)
 }

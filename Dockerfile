@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+COPY arachne-common ./arachne-common
 COPY arachne-ebpf ./arachne-ebpf
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
