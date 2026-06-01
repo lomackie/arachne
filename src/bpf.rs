@@ -10,9 +10,10 @@ use anyhow::Result;
 use nix::mount::MsFlags;
 
 use arachne_common::{
-    BackendKey, BackendVal, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_REDIRECT,
+    BackendKey, BackendVal, COUNTER_CT_EVICT, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_REDIRECT,
     COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT, COUNTER_SERVICE_SNAT, Endpoint,
-    BACKENDS_MAP, ENDPOINTS_MAP, SERVICES_MAP, ServiceKey, ServiceVal, endpoint_key,
+    BACKENDS_MAP, CT_DNAT_MAP, CT_SNAT_MAP, ENDPOINTS_MAP, NatKey, NatVal, SERVICES_MAP,
+    ServiceKey, ServiceVal, endpoint_key,
 };
 use crate::cni::CniError;
 
@@ -156,6 +157,89 @@ pub fn backends_upsert(key: BackendKey, val: BackendVal) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("insert BACKENDS entry: {e}"))
 }
 
+fn open_ct_map(name: &str) -> Result<HashMap<MapData, NatKey, NatVal>> {
+    let path = format!("{PIN_DIR}/{name}");
+    let map_data = MapData::from_pin(&path)
+        .map_err(|e| anyhow::anyhow!("open {name} map: {e}"))?;
+    HashMap::try_from(Map::HashMap(map_data))
+        .map_err(|e| anyhow::anyhow!("open {name} map: {e}"))
+}
+
+/// CLOCK_MONOTONIC nanoseconds — the same clock the datapath stamps entries with
+/// via `bpf_ktime_get_ns()`, so `last_seen` is directly comparable.
+fn monotonic_ns() -> Result<u64> {
+    let ts = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .map_err(|e| anyhow::anyhow!("clock_gettime(CLOCK_MONOTONIC): {e}"))?;
+    Ok(ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64)
+}
+
+#[derive(Default)]
+pub struct CtGcStats {
+    /// Conntrack entries examined across both maps.
+    pub scanned: u64,
+    /// Flows evicted (each removes a forward + reverse pair).
+    pub evicted: u64,
+}
+
+/// Sweep the conntrack maps and delete flows idle for longer than `idle_ns`.
+///
+/// Each flow occupies a forward (CT_DNAT) + reverse (CT_SNAT) entry. When either
+/// half is stale we delete both — reconstructing the partner key from the entry's
+/// value — so the two maps can never be left half-populated.
+pub fn ct_gc(idle_ns: u64) -> Result<CtGcStats> {
+    let now = monotonic_ns()?;
+    let mut dnat = open_ct_map(CT_DNAT_MAP)?;
+    let mut snat = open_ct_map(CT_SNAT_MAP)?;
+    let mut stats = CtGcStats::default();
+
+    // Forward sweep: CT_DNAT key = (client→vip), value = (backend ip/port).
+    let dnat_keys: Vec<NatKey> = dnat.keys().filter_map(Result::ok).collect();
+    for k in dnat_keys {
+        stats.scanned += 1;
+        let Ok(v) = dnat.get(&k, 0) else { continue };
+        if now.saturating_sub(v.last_seen) <= idle_ns {
+            continue;
+        }
+        let _ = dnat.remove(&k);
+        // Reverse partner: (backend→client).
+        let partner = NatKey {
+            src_ip: v.ip,
+            dst_ip: k.src_ip,
+            src_port: v.port,
+            dst_port: k.src_port,
+            proto: k.proto,
+            _pad: [0; 3],
+        };
+        let _ = snat.remove(&partner);
+        stats.evicted += 1;
+    }
+
+    // Reverse sweep: catch CT_SNAT entries whose partner was already gone, or
+    // that aged out independently. CT_SNAT key = (backend→client), value = vip.
+    let snat_keys: Vec<NatKey> = snat.keys().filter_map(Result::ok).collect();
+    for k in snat_keys {
+        stats.scanned += 1;
+        let Ok(v) = snat.get(&k, 0) else { continue };
+        if now.saturating_sub(v.last_seen) <= idle_ns {
+            continue;
+        }
+        let _ = snat.remove(&k);
+        // Forward partner: (client→vip).
+        let partner = NatKey {
+            src_ip: k.dst_ip,
+            dst_ip: v.ip,
+            src_port: k.dst_port,
+            dst_port: v.port,
+            proto: k.proto,
+            _pad: [0; 3],
+        };
+        let _ = dnat.remove(&partner);
+        stats.evicted += 1;
+    }
+
+    Ok(stats)
+}
+
 pub struct Counters {
     pub map_hit: u64,
     pub fib_miss: u64,
@@ -163,6 +247,7 @@ pub struct Counters {
     pub service_punt: u64,
     pub service_dnat: u64,
     pub service_snat: u64,
+    pub ct_evict: u64,
 }
 
 pub fn read_counters() -> Result<Counters> {
@@ -179,6 +264,7 @@ pub fn read_counters() -> Result<Counters> {
         service_punt: sum(map.get(&COUNTER_SERVICE_PUNT, 0)?),
         service_dnat: sum(map.get(&COUNTER_SERVICE_DNAT, 0)?),
         service_snat: sum(map.get(&COUNTER_SERVICE_SNAT, 0)?),
+        ct_evict: sum(map.get(&COUNTER_CT_EVICT, 0)?),
     })
 }
 

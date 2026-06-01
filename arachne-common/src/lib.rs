@@ -5,6 +5,8 @@ use core::net::Ipv4Addr;
 pub const ENDPOINTS_MAP: &str = "ENDPOINTS";
 pub const SERVICES_MAP: &str = "SERVICES";
 pub const BACKENDS_MAP: &str = "BACKENDS";
+pub const CT_DNAT_MAP: &str = "CT_DNAT";
+pub const CT_SNAT_MAP: &str = "CT_SNAT";
 
 pub const MAX_ENDPOINTS: u32 = 1 << 16;
 pub const MAX_SERVICES: u32 = 4096;
@@ -17,7 +19,8 @@ pub const COUNTER_REDIRECT: u32 = 2;
 pub const COUNTER_SERVICE_PUNT: u32 = 3;
 pub const COUNTER_SERVICE_DNAT: u32 = 4;
 pub const COUNTER_SERVICE_SNAT: u32 = 5;
-pub const COUNTER_MAX: u32 = 6;
+pub const COUNTER_CT_EVICT: u32 = 6;
+pub const COUNTER_MAX: u32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -89,14 +92,23 @@ pub struct NatKey {
     pub _pad: [u8; 3],
 }
 
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for NatKey {}
+
 /// Rewritten address+port: used as new-dst in CT_DNAT and new-src in CT_SNAT.
+/// `last_seen` is `bpf_ktime_get_ns()` (CLOCK_MONOTONIC ns) at the most recent
+/// packet on the flow, refreshed by the datapath and read by the userspace GC.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NatVal {
     pub ip: u32,
     pub port: u16,
     pub _pad: [u8; 2],
+    pub last_seen: u64,
 }
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for NatVal {}
 
 pub const fn endpoint_key(ip: Ipv4Addr) -> u32 {
     u32::from_le_bytes(ip.octets())
@@ -134,7 +146,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<BackendKey>(), 8);
         assert_eq!(core::mem::size_of::<BackendVal>(), 8);
         assert_eq!(core::mem::size_of::<NatKey>(), 16);
-        assert_eq!(core::mem::size_of::<NatVal>(), 8);
+        assert_eq!(core::mem::size_of::<NatVal>(), 16);
     }
 
     #[test]

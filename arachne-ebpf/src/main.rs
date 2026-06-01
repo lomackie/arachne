@@ -4,17 +4,17 @@
 use core::ffi::c_long;
 
 use arachne_common::{
-    BackendKey, BackendVal, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_MAX, COUNTER_REDIRECT,
-    COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT, COUNTER_SERVICE_SNAT, Endpoint, MAX_BACKENDS,
-    MAX_CT_ENTRIES, MAX_ENDPOINTS, MAX_SERVICES, NatKey, NatVal, ServiceKey, ServiceVal,
-    is_service_ip,
+    BackendKey, BackendVal, COUNTER_CT_EVICT, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_MAX,
+    COUNTER_REDIRECT, COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT, COUNTER_SERVICE_SNAT, Endpoint,
+    MAX_BACKENDS, MAX_CT_ENTRIES, MAX_ENDPOINTS, MAX_SERVICES, NatKey, NatVal, ServiceKey,
+    ServiceVal, is_service_ip,
 };
 use aya_ebpf::{
     EbpfContext,
     bindings::{TC_ACT_OK, __sk_buff, bpf_fib_lookup as BpfFibLookup},
-    helpers::{bpf_fib_lookup, bpf_get_prandom_u32, bpf_redirect},
+    helpers::{bpf_fib_lookup, bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_redirect},
     macros::{classifier, map},
-    maps::{HashMap, LruHashMap, PerCpuArray},
+    maps::{HashMap, PerCpuArray},
     programs::TcContext,
 };
 
@@ -30,11 +30,14 @@ static BACKENDS: HashMap<BackendKey, BackendVal> = HashMap::pinned(MAX_BACKENDS,
 // Conntrack maps: shared across all TC programs on a node via bpffs pinning.
 // CT_DNAT caches the forward-flow backend choice (client→svc → client→backend).
 // CT_SNAT caches the reverse SNAT mapping (backend→client → svc→client).
+// Plain HashMaps (not LRU): entries are reclaimed deterministically — on RST in
+// the datapath, and by the userspace idle-timeout GC sweep — never by silently
+// evicting a live flow. A full table punts new flows to the kernel (see below).
 #[map]
-static CT_DNAT: LruHashMap<NatKey, NatVal> = LruHashMap::pinned(MAX_CT_ENTRIES, 0);
+static CT_DNAT: HashMap<NatKey, NatVal> = HashMap::pinned(MAX_CT_ENTRIES, 0);
 
 #[map]
-static CT_SNAT: LruHashMap<NatKey, NatVal> = LruHashMap::pinned(MAX_CT_ENTRIES, 0);
+static CT_SNAT: HashMap<NatKey, NatVal> = HashMap::pinned(MAX_CT_ENTRIES, 0);
 
 #[map]
 static COUNTERS: PerCpuArray<u64> = PerCpuArray::pinned(COUNTER_MAX, 0);
@@ -44,6 +47,14 @@ const ETH_P_IP: u16 = 0x0800;
 const AF_INET: u8 = 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+
+// TCP flags byte sits at offset 13 within the TCP header; RST is bit 2.
+const TCP_FLAGS_OFF: usize = 13;
+const TCP_RST: u8 = 0x04;
+
+// Only rewrite a conntrack entry's last_seen if it's older than this, to avoid a
+// map write on every packet of a busy flow. The GC idle timeout is far larger.
+const CT_REFRESH_NS: u64 = 1_000_000_000; // 1s
 
 // For l4_csum_replace: indicates the changed field is in the pseudo-header.
 const BPF_F_PSEUDO_HDR: u64 = 0x10;
@@ -82,6 +93,14 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
         } else {
             ETH_HLEN + ihl + 6
         };
+        // RST tears the flow down; UDP has no flags, so treat it as 0.
+        let tcp_flags: u8 = if ip_proto == IPPROTO_TCP {
+            ctx.load(ETH_HLEN + ihl + TCP_FLAGS_OFF)?
+        } else {
+            0
+        };
+        let is_rst = tcp_flags & TCP_RST != 0;
+        let now = unsafe { bpf_ktime_get_ns() };
 
         // Check CT_SNAT: return packet from a backend we previously DNAT'd to.
         let snat_key = NatKey {
@@ -92,10 +111,14 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             proto: ip_proto,
             _pad: [0; 3],
         };
-        if let Some(snat) = unsafe { CT_SNAT.get(&snat_key) } {
+        if let Some(snat) = unsafe { CT_SNAT.get_ptr_mut(&snat_key) } {
             // Copy values immediately before any further map operations.
             let new_ip = unsafe { (*snat).ip };
             let new_port = unsafe { (*snat).port };
+            let last_seen = unsafe { (*snat).last_seen };
+            if !is_rst && now.wrapping_sub(last_seen) > CT_REFRESH_NS {
+                unsafe { (*snat).last_seen = now };
+            }
 
             // SNAT: rewrite src IP and src port, update checksums.
             ctx.store(ETH_HLEN + 12, &new_ip, 0)?;
@@ -105,6 +128,22 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             ctx.l4_csum_replace(l4_csum_off, src_port as u64, new_port as u64, 2)?;
 
             bump(COUNTER_SERVICE_SNAT);
+
+            if is_rst {
+                // Tear down both halves. The forward key is the mirror: the client
+                // is this packet's dst, the VIP is the value we just read.
+                let _ = CT_SNAT.remove(&snat_key);
+                let dnat_key = NatKey {
+                    src_ip: ip_dst,
+                    dst_ip: new_ip,
+                    src_port: dst_port,
+                    dst_port: new_port,
+                    proto: ip_proto,
+                    _pad: [0; 3],
+                };
+                let _ = CT_DNAT.remove(&dnat_key);
+                bump(COUNTER_CT_EVICT);
+            }
             // ip_dst is the original destination (client pod); forward normally.
         } else if is_service_ip(ip_dst) {
             // Service DNAT: check if we have a cached backend for this flow.
@@ -118,8 +157,14 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             };
 
             let (new_dst_ip, new_dst_port) =
-                if let Some(cached) = unsafe { CT_DNAT.get(&dnat_key) } {
-                    (unsafe { (*cached).ip }, unsafe { (*cached).port })
+                if let Some(cached) = unsafe { CT_DNAT.get_ptr_mut(&dnat_key) } {
+                    let ip = unsafe { (*cached).ip };
+                    let port = unsafe { (*cached).port };
+                    let last_seen = unsafe { (*cached).last_seen };
+                    if !is_rst && now.wrapping_sub(last_seen) > CT_REFRESH_NS {
+                        unsafe { (*cached).last_seen = now };
+                    }
+                    (ip, port)
                 } else {
                     // First packet of this flow: look up service and pick a backend.
                     let svc_key = ServiceKey { vip: ip_dst, port: dst_port, proto: ip_proto, _pad: 0 };
@@ -145,13 +190,16 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
                     let pod_ip = unsafe { (*bk).pod_ip };
                     let pod_port = unsafe { (*bk).pod_port };
 
-                    // Cache the forward DNAT decision for subsequent packets.
-                    let _ = CT_DNAT.insert(
-                        &dnat_key,
-                        &NatVal { ip: pod_ip, port: pod_port, _pad: [0; 2] },
-                        0,
-                    );
-                    // Cache the reverse SNAT for return packets from the backend.
+                    // Cache the forward DNAT decision for subsequent packets. A full
+                    // table means we can't track the flow: punt to the kernel rather
+                    // than DNAT uncached (which would re-pick a backend every packet).
+                    let fwd = NatVal { ip: pod_ip, port: pod_port, _pad: [0; 2], last_seen: now };
+                    if CT_DNAT.insert(&dnat_key, &fwd, 0).is_err() {
+                        bump(COUNTER_SERVICE_PUNT);
+                        return Ok(TC_ACT_OK as i32);
+                    }
+                    // Cache the reverse SNAT for return packets from the backend. Keep
+                    // the two maps consistent: if this fails, drop the forward half too.
                     let snat_rev = NatKey {
                         src_ip: pod_ip,
                         dst_ip: ip_src,
@@ -160,11 +208,12 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
                         proto: ip_proto,
                         _pad: [0; 3],
                     };
-                    let _ = CT_SNAT.insert(
-                        &snat_rev,
-                        &NatVal { ip: ip_dst, port: dst_port, _pad: [0; 2] },
-                        0,
-                    );
+                    let rev = NatVal { ip: ip_dst, port: dst_port, _pad: [0; 2], last_seen: now };
+                    if CT_SNAT.insert(&snat_rev, &rev, 0).is_err() {
+                        let _ = CT_DNAT.remove(&dnat_key);
+                        bump(COUNTER_SERVICE_PUNT);
+                        return Ok(TC_ACT_OK as i32);
+                    }
 
                     (pod_ip, pod_port)
                 };
@@ -177,6 +226,23 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             ctx.l4_csum_replace(l4_csum_off, dst_port as u64, new_dst_port as u64, 2)?;
 
             bump(COUNTER_SERVICE_DNAT);
+
+            if is_rst {
+                // Tear down both halves. The reverse key mirrors the forward flow:
+                // the backend we just DNAT'd to is the src, the client is the dst.
+                let _ = CT_DNAT.remove(&dnat_key);
+                let snat_rev = NatKey {
+                    src_ip: new_dst_ip,
+                    dst_ip: ip_src,
+                    src_port: new_dst_port,
+                    dst_port: src_port,
+                    proto: ip_proto,
+                    _pad: [0; 3],
+                };
+                let _ = CT_SNAT.remove(&snat_rev);
+                bump(COUNTER_CT_EVICT);
+            }
+
             ip_dst = new_dst_ip;
         }
     } else if is_service_ip(ip_dst) {

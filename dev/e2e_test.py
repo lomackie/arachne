@@ -357,6 +357,114 @@ def test_service_load_balancing(core_v1):
         _delete_service(core_v1, svc)
 
 
+# ── Conntrack GC ───────────────────────────────────────────────────────────────
+
+DS_NAME = "arachne"
+DS_NS = "kube-system"
+
+
+@pytest.fixture(scope="session")
+def apps_v1():
+    config.load_kube_config(config_file=os.environ.get("KUBECONFIG"))
+    return client.AppsV1Api()
+
+
+def _patch_agent_env(apps_v1, env):
+    """Strategic-merge the agent container's env (list merged by name)."""
+    body = {"spec": {"template": {"spec": {"containers": [
+        {"name": "agent", "env": env},
+    ]}}}}
+    apps_v1.patch_namespaced_daemon_set(
+        DS_NAME, DS_NS, body,
+        _content_type="application/strategic-merge-patch+json",
+    )
+
+
+def _agent_pod_on(core_v1, node_name):
+    for p in core_v1.list_namespaced_pod("kube-system", label_selector="app=arachne").items:
+        if p.spec.node_name == node_name:
+            return p
+    return None
+
+
+def _wait_agent_ready_with_env(core_v1, node_name, env_name, present):
+    """Wait until the node's agent pod is Running/Ready and its env contains
+    (or lacks) env_name — i.e. the rollout with the new config has landed."""
+    def check():
+        p = _agent_pod_on(core_v1, node_name)
+        if p is None or p.status.phase != "Running":
+            return None
+        if not all(cs.ready for cs in (p.status.container_statuses or [])):
+            return None
+        agent = next((c for c in p.spec.containers if c.name == "agent"), None)
+        names = {e.name for e in (agent.env or [])}
+        return p.metadata.name if (env_name in names) == present else None
+    return _wait(check, timeout=120)
+
+
+def test_conntrack_gc_reaps_idle_flows(core_v1, apps_v1):
+    """The idle GC reaps stale conntrack flows.
+
+    Sends one-shot UDP packets at the kube-dns ClusterIP. UDP has no FIN/RST, so
+    the datapath never tears the flow down; the forward packet alone creates a
+    (forward, reverse) conntrack pair that then sits idle until the sweep reaps
+    it. The assertion relies only on the entry being created and aged out, not on
+    a reply. The agent is driven with a short idle timeout + sweep interval.
+    """
+    nodes = core_v1.list_node().items
+    workers = [n for n in nodes if "node-role.kubernetes.io/control-plane" not in (n.metadata.labels or {})]
+    node_name = workers[0].metadata.name
+
+    dns_ip = core_v1.read_namespaced_service("kube-dns", "kube-system").spec.cluster_ip
+    client_pod = "arachne-e2e-gc-cli"
+
+    # Aggressive timers so the test is fast: reap flows idle > 4s, sweep every 2s.
+    _patch_agent_env(apps_v1, [
+        {"name": "ARACHNE_CT_IDLE_SECS", "value": "4"},
+        {"name": "ARACHNE_CT_GC_SECS", "value": "2"},
+    ])
+    try:
+        _wait_agent_ready_with_env(core_v1, node_name, "ARACHNE_CT_IDLE_SECS", present=True)
+
+        _delete_pods(core_v1, client_pod)
+        core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(client_pod, node_name))
+        _wait_running_ip(core_v1, client_pod)
+
+        agent = _agent_pod_on(core_v1, node_name)
+
+        # Each send creates a conntrack pair for a service flow that gets no reply.
+        for _ in range(3):
+            stream(
+                core_v1.connect_get_namespaced_pod_exec,
+                client_pod, NAMESPACE,
+                command=["sh", "-c", f"echo q | nc -u -w1 {dns_ip} 53"],
+                stderr=True, stdin=False, stdout=True, tty=False,
+            )
+
+        def gc_evicted():
+            # _preload_content=False + decode: the default path returns the str()
+            # of a bytes object (literal b'…\n…'), which won't split into lines.
+            resp = core_v1.read_namespaced_pod_log(
+                agent.metadata.name, "kube-system", container="agent", tail_lines=300,
+                _preload_content=False,
+            )
+            logs = resp.data.decode("utf-8", "replace")
+            for line in logs.splitlines():
+                if line.startswith("conntrack gc:") and "evicted=" in line:
+                    if int(line.split("evicted=")[1].split()[0]) > 0:
+                        return line
+            return None
+
+        assert _wait(gc_evicted, timeout=40), "GC never reported an eviction"
+    finally:
+        _patch_agent_env(apps_v1, [
+            {"name": "ARACHNE_CT_IDLE_SECS", "$patch": "delete"},
+            {"name": "ARACHNE_CT_GC_SECS", "$patch": "delete"},
+        ])
+        _wait_agent_ready_with_env(core_v1, node_name, "ARACHNE_CT_IDLE_SECS", present=False)
+        _delete_pods(core_v1, client_pod)
+
+
 CLUSTER_NAME = "arachne-dev"
 
 

@@ -1,3 +1,4 @@
+mod conntrack;
 mod routes;
 mod services;
 mod startup;
@@ -29,6 +30,10 @@ pub async fn run() -> Result<()> {
     let mut counter_tick = tokio::time::interval(Duration::from_secs(30));
     counter_tick.tick().await;
 
+    let ct_idle = conntrack::idle_timeout();
+    let mut gc_tick = tokio::time::interval(conntrack::gc_interval());
+    gc_tick.tick().await;
+
     loop {
         tokio::select! {
             _ = sigterm.recv() => break,
@@ -41,11 +46,14 @@ pub async fn run() -> Result<()> {
             _ = counter_tick.tick() => {
                 match crate::bpf::read_counters() {
                     Ok(c) => eprintln!(
-                        "counters: map_hit={} fib_miss={} redirect={} service_punt={} svc_dnat={} svc_snat={}",
-                        c.map_hit, c.fib_miss, c.redirect, c.service_punt, c.service_dnat, c.service_snat
+                        "counters: map_hit={} fib_miss={} redirect={} service_punt={} svc_dnat={} svc_snat={} ct_evict={}",
+                        c.map_hit, c.fib_miss, c.redirect, c.service_punt, c.service_dnat, c.service_snat, c.ct_evict
                     ),
                     Err(e) => eprintln!("counters: read failed: {e}"),
                 }
+            }
+            _ = gc_tick.tick() => {
+                conntrack::gc_tick(ct_idle);
             }
         }
     }

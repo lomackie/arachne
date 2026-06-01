@@ -38,8 +38,11 @@ reload: install
 test:
     cargo test
 
+# Run the kernel verifier test under sudo. Uses a dedicated target dir so the
+# root-owned build artifacts never land in the main `target/` (which would then
+# break subsequent non-sudo cargo invocations with permission errors).
 verify-ebpf:
-    sudo -E env "PATH=$PATH" cargo test ebpf_verifier_accepts -- --nocapture
+    CARGO_TARGET_DIR={{justfile_directory()}}/target/verify sudo -E env "PATH=$PATH" cargo test ebpf_verifier_accepts -- --nocapture
 
 e2e:
     KUBECONFIG={{kubeconfig}} uv run --with-requirements dev/requirements.txt pytest dev/e2e_test.py -v
