@@ -217,6 +217,146 @@ def test_cross_node_pod_routing(core_v1):
         _delete_pods(core_v1, pod_a, pod_b)
 
 
+# ── Service load balancing ─────────────────────────────────────────────────────
+
+SVC_APP_LABEL = "arachne-e2e-svc"
+
+
+def _httpd_pod(name, node_name):
+    """A backend pod serving its own hostname over HTTP on :8080."""
+    return client.V1Pod(
+        metadata=client.V1ObjectMeta(name=name, labels={"app": SVC_APP_LABEL}),
+        spec=client.V1PodSpec(
+            node_name=node_name,
+            containers=[client.V1Container(
+                name="httpd",
+                image="busybox:1.36",
+                command=["sh", "-c",
+                         'echo "$HOSTNAME" > /tmp/index.html && httpd -f -p 8080 -h /tmp'],
+                ports=[client.V1ContainerPort(container_port=8080)],
+                readiness_probe=client.V1Probe(
+                    tcp_socket=client.V1TCPSocketAction(port=8080),
+                    period_seconds=1,
+                ),
+            )],
+            restart_policy="Never",
+        ),
+    )
+
+
+def _service(name, port=80, target_port=8080):
+    return client.V1Service(
+        metadata=client.V1ObjectMeta(name=name),
+        spec=client.V1ServiceSpec(
+            selector={"app": SVC_APP_LABEL},
+            ports=[client.V1ServicePort(port=port, target_port=target_port, protocol="TCP")],
+        ),
+    )
+
+
+def _delete_service(core_v1, name):
+    try:
+        core_v1.delete_namespaced_service(name, NAMESPACE)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+
+def _curl(core_v1, pod, url):
+    """wget the URL from inside a pod; returns stripped stdout (combined w/ stderr)."""
+    out = stream(
+        core_v1.connect_get_namespaced_pod_exec,
+        pod, NAMESPACE,
+        command=["wget", "-qO-", "-T", "2", url],
+        stderr=True, stdin=False, stdout=True, tty=False,
+    )
+    return out.strip()
+
+
+def _wait_response_in(core_v1, client_pod, url, expected):
+    """Retry the request until it returns one of the expected backend hostnames.
+
+    The retry naturally waits for the agent to program the BPF SERVICES/BACKENDS
+    maps — until then the datapath punts the ClusterIP to the kernel, which has
+    no route for it, so the request fails.
+    """
+    def check():
+        out = _curl(core_v1, client_pod, url)
+        return out if out in expected else None
+    return _wait(check)
+
+
+def test_service_clusterip_dnat(core_v1):
+    """A pod can reach a backend through a Service ClusterIP (datapath DNAT)."""
+    nodes = core_v1.list_node().items
+    workers = [n for n in nodes if "node-role.kubernetes.io/control-plane" not in (n.metadata.labels or {})]
+    node_name = workers[0].metadata.name
+
+    backend, client_pod, svc = "arachne-e2e-svc-be", "arachne-e2e-svc-cli", "arachne-e2e-svc"
+    _delete_pods(core_v1, backend, client_pod)
+    _delete_service(core_v1, svc)
+
+    core_v1.create_namespaced_pod(NAMESPACE, _httpd_pod(backend, node_name))
+    core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(client_pod, node_name))
+    created_svc = core_v1.create_namespaced_service(NAMESPACE, _service(svc))
+
+    try:
+        _wait_running_ip(core_v1, backend)
+        _wait_running_ip(core_v1, client_pod)
+
+        cluster_ip = created_svc.spec.cluster_ip
+        assert cluster_ip.startswith("10.96.") or cluster_ip.startswith("10."), \
+            f"unexpected ClusterIP: {cluster_ip}"
+
+        url = f"http://{cluster_ip}:80/"
+        resp = _wait_response_in(core_v1, client_pod, url, {backend})
+        assert resp == backend, f"expected {backend}, got {resp!r}"
+    finally:
+        _delete_pods(core_v1, backend, client_pod)
+        _delete_service(core_v1, svc)
+
+
+def test_service_load_balancing(core_v1):
+    """Requests across distinct connections spread over multiple backends."""
+    nodes = core_v1.list_node().items
+    workers = [n for n in nodes if "node-role.kubernetes.io/control-plane" not in (n.metadata.labels or {})]
+    node_name = workers[0].metadata.name
+
+    be_a, be_b = "arachne-e2e-lb-a", "arachne-e2e-lb-b"
+    client_pod, svc = "arachne-e2e-lb-cli", "arachne-e2e-lb"
+    _delete_pods(core_v1, be_a, be_b, client_pod)
+    _delete_service(core_v1, svc)
+
+    core_v1.create_namespaced_pod(NAMESPACE, _httpd_pod(be_a, node_name))
+    core_v1.create_namespaced_pod(NAMESPACE, _httpd_pod(be_b, node_name))
+    core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(client_pod, node_name))
+    created_svc = core_v1.create_namespaced_service(NAMESPACE, _service(svc))
+
+    backends = {be_a, be_b}
+    try:
+        _wait_running_ip(core_v1, be_a)
+        _wait_running_ip(core_v1, be_b)
+        _wait_running_ip(core_v1, client_pod)
+
+        url = f"http://{created_svc.spec.cluster_ip}:80/"
+        # Wait until the service routes to *both* backends — the agent programs
+        # each EndpointSlice independently, so endpoints land in the map over time.
+        seen = set()
+
+        def both_seen():
+            seen.add(_curl(core_v1, client_pod, url))
+            hit = seen & backends
+            return hit if len(hit) >= 2 else None
+
+        # Backend choice is random per flow (bpf_get_prandom_u32 % count); each
+        # wget is a fresh connection, so ~30 attempts hits both with near-certainty.
+        hits = _wait(both_seen, timeout=90)
+        assert hits == backends, f"expected to reach both backends, saw {seen}"
+    finally:
+        _delete_pods(core_v1, be_a, be_b, client_pod)
+        _delete_service(core_v1, svc)
+
+
 CLUSTER_NAME = "arachne-dev"
 
 
