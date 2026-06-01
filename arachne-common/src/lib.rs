@@ -3,12 +3,21 @@
 use core::net::Ipv4Addr;
 
 pub const ENDPOINTS_MAP: &str = "ENDPOINTS";
+pub const SERVICES_MAP: &str = "SERVICES";
+pub const BACKENDS_MAP: &str = "BACKENDS";
+
 pub const MAX_ENDPOINTS: u32 = 1 << 16;
+pub const MAX_SERVICES: u32 = 4096;
+pub const MAX_BACKENDS: u32 = 1 << 16;
+pub const MAX_CT_ENTRIES: u32 = 1 << 16;
 
 pub const COUNTER_MAP_HIT: u32 = 0;
 pub const COUNTER_FIB_MISS: u32 = 1;
 pub const COUNTER_REDIRECT: u32 = 2;
-pub const COUNTER_MAX: u32 = 3;
+pub const COUNTER_SERVICE_PUNT: u32 = 3;
+pub const COUNTER_SERVICE_DNAT: u32 = 4;
+pub const COUNTER_SERVICE_SNAT: u32 = 5;
+pub const COUNTER_MAX: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -20,8 +29,92 @@ pub struct Endpoint {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Endpoint {}
 
+/// Key for the service map: the ClusterIP + service port + IP protocol.
+/// Ports are stored in the same byte order as `ctx.load::<u16>` returns on
+/// a little-endian host (i.e. network-byte-order bytes interpreted as LE u16).
+/// Use `port_key(port)` to convert a host-order port to this representation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ServiceKey {
+    pub vip: u32,
+    pub port: u16,
+    pub proto: u8,
+    pub _pad: u8,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ServiceKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ServiceVal {
+    pub service_id: u32,
+    pub backend_count: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ServiceVal {}
+
+/// Key for the backend map: (service_id, slot index).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BackendKey {
+    pub service_id: u32,
+    pub index: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BackendKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BackendVal {
+    pub pod_ip: u32,
+    pub pod_port: u16,
+    pub _pad: [u8; 2],
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BackendVal {}
+
+/// 5-tuple key for the conntrack maps (CT_DNAT, CT_SNAT).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NatKey {
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub proto: u8,
+    pub _pad: [u8; 3],
+}
+
+/// Rewritten address+port: used as new-dst in CT_DNAT and new-src in CT_SNAT.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NatVal {
+    pub ip: u32,
+    pub port: u16,
+    pub _pad: [u8; 2],
+}
+
 pub const fn endpoint_key(ip: Ipv4Addr) -> u32 {
     u32::from_le_bytes(ip.octets())
+}
+
+/// Convert a host-order port to the map-key representation that matches what
+/// `ctx.load::<u16>` returns when reading that port from a packet on a
+/// little-endian host (i.e. swap the bytes).
+pub const fn port_key(port: u16) -> u16 {
+    port.swap_bytes()
+}
+
+// ClusterIP service range (kube `--service-cluster-ip-range`, 10.96.0.0/12).
+const SERVICE_CIDR_BASE: u32 = u32::from_le_bytes([10, 96, 0, 0]);
+const SERVICE_CIDR_MASK: u32 = u32::from_le_bytes([255, 240, 0, 0]);
+
+pub const fn is_service_ip(dst: u32) -> bool {
+    dst & SERVICE_CIDR_MASK == SERVICE_CIDR_BASE & SERVICE_CIDR_MASK
 }
 
 #[cfg(test)]
@@ -35,8 +128,35 @@ mod tests {
     }
 
     #[test]
+    fn service_key_layout() {
+        assert_eq!(core::mem::size_of::<ServiceKey>(), 8);
+        assert_eq!(core::mem::size_of::<ServiceVal>(), 8);
+        assert_eq!(core::mem::size_of::<BackendKey>(), 8);
+        assert_eq!(core::mem::size_of::<BackendVal>(), 8);
+        assert_eq!(core::mem::size_of::<NatKey>(), 16);
+        assert_eq!(core::mem::size_of::<NatVal>(), 8);
+    }
+
+    #[test]
     fn key_matches_network_order_load() {
         let ip = Ipv4Addr::new(10, 244, 1, 5);
         assert_eq!(endpoint_key(ip), u32::from_le_bytes([10, 244, 1, 5]));
+    }
+
+    #[test]
+    fn port_key_matches_packet_load() {
+        // Port 80 in a packet is bytes [0x00, 0x50]; loaded as LE u16 on x86 = 0x5000.
+        assert_eq!(port_key(80), 0x5000u16);
+        assert_eq!(port_key(53), 53u16.swap_bytes());
+    }
+
+    #[test]
+    fn service_ips_are_detected() {
+        assert!(is_service_ip(endpoint_key(Ipv4Addr::new(10, 96, 0, 1))));
+        assert!(is_service_ip(endpoint_key(Ipv4Addr::new(10, 96, 0, 10))));
+        assert!(is_service_ip(endpoint_key(Ipv4Addr::new(10, 111, 255, 255))));
+        assert!(!is_service_ip(endpoint_key(Ipv4Addr::new(10, 244, 1, 5))));
+        assert!(!is_service_ip(endpoint_key(Ipv4Addr::new(10, 95, 255, 255))));
+        assert!(!is_service_ip(endpoint_key(Ipv4Addr::new(10, 112, 0, 0))));
     }
 }

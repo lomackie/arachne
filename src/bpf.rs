@@ -10,7 +10,9 @@ use anyhow::Result;
 use nix::mount::MsFlags;
 
 use arachne_common::{
-    COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_REDIRECT, Endpoint, ENDPOINTS_MAP, endpoint_key,
+    BackendKey, BackendVal, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_REDIRECT,
+    COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT, COUNTER_SERVICE_SNAT, Endpoint,
+    BACKENDS_MAP, ENDPOINTS_MAP, SERVICES_MAP, ServiceKey, ServiceVal, endpoint_key,
 };
 use crate::cni::CniError;
 
@@ -18,9 +20,6 @@ static EBPF_BYTES: &[u8] = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/ara
 
 const PIN_DIR: &str = "/sys/fs/bpf/arachne";
 
-/// Mount bpffs at /sys/fs/bpf if it isn't already. Must be called by the
-/// agent (which has Bidirectional mount propagation) before any pinning,
-/// so the CNI plugin running on the host also sees the mount.
 pub fn ensure_bpffs() -> Result<()> {
     let mounts = std::fs::read_to_string("/proc/mounts")?;
     let already_mounted = mounts.lines().any(|l| {
@@ -107,16 +106,63 @@ fn open_endpoints_map() -> Result<HashMap<MapData, u32, Endpoint>, CniError> {
         .map_err(|e| CniError::Netlink(format!("open ENDPOINTS map: {e}")))
 }
 
+fn open_services_map() -> Result<HashMap<MapData, ServiceKey, ServiceVal>> {
+    let path = format!("{PIN_DIR}/{SERVICES_MAP}");
+    let map_data = MapData::from_pin(&path)
+        .map_err(|e| anyhow::anyhow!("open SERVICES map: {e}"))?;
+    HashMap::try_from(Map::HashMap(map_data))
+        .map_err(|e| anyhow::anyhow!("open SERVICES map: {e}"))
+}
+
+fn open_backends_map() -> Result<HashMap<MapData, BackendKey, BackendVal>> {
+    let path = format!("{PIN_DIR}/{BACKENDS_MAP}");
+    let map_data = MapData::from_pin(&path)
+        .map_err(|e| anyhow::anyhow!("open BACKENDS map: {e}"))?;
+    HashMap::try_from(Map::HashMap(map_data))
+        .map_err(|e| anyhow::anyhow!("open BACKENDS map: {e}"))
+}
+
 pub fn endpoints_insert(pod_ip: Ipv4Addr, ifindex: u32, mac: [u8; 6]) -> Result<(), CniError> {
     let mut map = open_endpoints_map()?;
     map.insert(endpoint_key(pod_ip), Endpoint { ifindex, mac }, 0)
         .map_err(|e| CniError::Netlink(format!("insert ENDPOINTS entry: {e}")))
 }
 
+pub fn endpoints_remove(pod_ip: Ipv4Addr) -> Result<(), CniError> {
+    let mut map = open_endpoints_map()?;
+    map.remove(&endpoint_key(pod_ip))
+        .map_err(|e| CniError::Netlink(format!("remove ENDPOINTS entry: {e}")))
+}
+
+pub fn services_upsert(key: ServiceKey, val: ServiceVal) -> Result<()> {
+    let mut map = open_services_map()?;
+    map.insert(key, val, 0)
+        .map_err(|e| anyhow::anyhow!("insert SERVICES entry: {e}"))
+}
+
+pub fn services_remove(key: ServiceKey) -> Result<()> {
+    let mut map = open_services_map()?;
+    // Ignore NotFound: the entry may have been removed already.
+    match map.remove(&key) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("No such file") => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("remove SERVICES entry: {e}")),
+    }
+}
+
+pub fn backends_upsert(key: BackendKey, val: BackendVal) -> Result<()> {
+    let mut map = open_backends_map()?;
+    map.insert(key, val, 0)
+        .map_err(|e| anyhow::anyhow!("insert BACKENDS entry: {e}"))
+}
+
 pub struct Counters {
     pub map_hit: u64,
     pub fib_miss: u64,
     pub redirect: u64,
+    pub service_punt: u64,
+    pub service_dnat: u64,
+    pub service_snat: u64,
 }
 
 pub fn read_counters() -> Result<Counters> {
@@ -130,13 +176,10 @@ pub fn read_counters() -> Result<Counters> {
         map_hit: sum(map.get(&COUNTER_MAP_HIT, 0)?),
         fib_miss: sum(map.get(&COUNTER_FIB_MISS, 0)?),
         redirect: sum(map.get(&COUNTER_REDIRECT, 0)?),
+        service_punt: sum(map.get(&COUNTER_SERVICE_PUNT, 0)?),
+        service_dnat: sum(map.get(&COUNTER_SERVICE_DNAT, 0)?),
+        service_snat: sum(map.get(&COUNTER_SERVICE_SNAT, 0)?),
     })
-}
-
-pub fn endpoints_remove(pod_ip: Ipv4Addr) -> Result<(), CniError> {
-    let mut map = open_endpoints_map()?;
-    map.remove(&endpoint_key(pod_ip))
-        .map_err(|e| CniError::Netlink(format!("remove ENDPOINTS entry: {e}")))
 }
 
 #[cfg(test)]
