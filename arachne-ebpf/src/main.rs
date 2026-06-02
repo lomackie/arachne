@@ -58,6 +58,10 @@ const CT_REFRESH_NS: u64 = 1_000_000_000; // 1s
 
 // For l4_csum_replace: indicates the changed field is in the pseudo-header.
 const BPF_F_PSEUDO_HDR: u64 = 0x10;
+// For l4_csum_replace on UDP: the checksum field is optional. A 0 means "no
+// checksum" and must be left untouched (not patched into a bogus value); a
+// recomputed 0 must be written as 0xffff. TCP must never set this.
+const BPF_F_MARK_MANGLED_0: u64 = 0x20;
 
 #[inline(always)]
 fn bump(index: u32) {
@@ -93,6 +97,13 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
         } else {
             ETH_HLEN + ihl + 6
         };
+        // UDP checksums are optional: l4_csum_replace must special-case 0 so a
+        // checksumless datagram isn't corrupted into a bogus value (TCP never).
+        let l4_mangle = if ip_proto == IPPROTO_UDP {
+            BPF_F_MARK_MANGLED_0
+        } else {
+            0
+        };
         // RST tears the flow down; UDP has no flags, so treat it as 0.
         let tcp_flags: u8 = if ip_proto == IPPROTO_TCP {
             ctx.load(ETH_HLEN + ihl + TCP_FLAGS_OFF)?
@@ -123,9 +134,14 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             // SNAT: rewrite src IP and src port, update checksums.
             ctx.store(ETH_HLEN + 12, &new_ip, 0)?;
             ctx.l3_csum_replace(ETH_HLEN + 10, ip_src as u64, new_ip as u64, 4)?;
-            ctx.l4_csum_replace(l4_csum_off, ip_src as u64, new_ip as u64, BPF_F_PSEUDO_HDR | 4)?;
+            ctx.l4_csum_replace(
+                l4_csum_off,
+                ip_src as u64,
+                new_ip as u64,
+                BPF_F_PSEUDO_HDR | l4_mangle | 4,
+            )?;
             ctx.store(ETH_HLEN + ihl, &new_port, 0)?;
-            ctx.l4_csum_replace(l4_csum_off, src_port as u64, new_port as u64, 2)?;
+            ctx.l4_csum_replace(l4_csum_off, src_port as u64, new_port as u64, l4_mangle | 2)?;
 
             bump(COUNTER_SERVICE_SNAT);
 
@@ -221,9 +237,14 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             // DNAT: rewrite dst IP and dst port, update checksums.
             ctx.store(ETH_HLEN + 16, &new_dst_ip, 0)?;
             ctx.l3_csum_replace(ETH_HLEN + 10, ip_dst as u64, new_dst_ip as u64, 4)?;
-            ctx.l4_csum_replace(l4_csum_off, ip_dst as u64, new_dst_ip as u64, BPF_F_PSEUDO_HDR | 4)?;
+            ctx.l4_csum_replace(
+                l4_csum_off,
+                ip_dst as u64,
+                new_dst_ip as u64,
+                BPF_F_PSEUDO_HDR | l4_mangle | 4,
+            )?;
             ctx.store(ETH_HLEN + ihl + 2, &new_dst_port, 0)?;
-            ctx.l4_csum_replace(l4_csum_off, dst_port as u64, new_dst_port as u64, 2)?;
+            ctx.l4_csum_replace(l4_csum_off, dst_port as u64, new_dst_port as u64, l4_mangle | 2)?;
 
             bump(COUNTER_SERVICE_DNAT);
 

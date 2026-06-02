@@ -286,6 +286,22 @@ def _wait_response_in(core_v1, client_pod, url, expected):
     return _wait(check)
 
 
+def _nslookup(core_v1, pod, name, server):
+    """Resolve `name` against `server` over UDP from inside a pod.
+
+    busybox nslookup queries the given server over UDP; `timeout` bounds the wait
+    so a dropped/unanswered query fails fast instead of hanging the exec stream.
+    Returns the combined stdout/stderr.
+    """
+    out = stream(
+        core_v1.connect_get_namespaced_pod_exec,
+        pod, NAMESPACE,
+        command=["sh", "-c", f"timeout 5 nslookup {name} {server} 2>&1"],
+        stderr=True, stdin=False, stdout=True, tty=False,
+    )
+    return out.strip()
+
+
 def test_service_clusterip_dnat(core_v1):
     """A pod can reach a backend through a Service ClusterIP (datapath DNAT)."""
     nodes = core_v1.list_node().items
@@ -355,6 +371,46 @@ def test_service_load_balancing(core_v1):
     finally:
         _delete_pods(core_v1, be_a, be_b, client_pod)
         _delete_service(core_v1, svc)
+
+
+def test_service_clusterip_udp_dns(core_v1):
+    """UDP to a Service ClusterIP gets a reply (regression: UDP NAT checksum).
+
+    The issue's repro: resolve an in-cluster name through the kube-dns ClusterIP
+    over UDP. The forward query is DNAT'd to a CoreDNS backend and the reply
+    SNAT'd back, both of which rewrite the *optional* UDP checksum. The original
+    bug patched a 0/absent checksum into a bogus value, so the DNAT'd query was
+    silently dropped and the lookup timed out — even though TCP ClusterIP and
+    direct UDP-to-pod both worked. A successful resolution proves the reply made
+    it back through SNAT intact.
+    """
+    nodes = core_v1.list_node().items
+    workers = [n for n in nodes if "node-role.kubernetes.io/control-plane" not in (n.metadata.labels or {})]
+    node_name = workers[0].metadata.name
+
+    dns_ip = core_v1.read_namespaced_service("kube-dns", "kube-system").spec.cluster_ip
+    # The well-known kubernetes API service; its ClusterIP is what DNS returns for
+    # the name below, so finding it in the output confirms a real, intact answer.
+    expected_ip = core_v1.read_namespaced_service("kubernetes", "default").spec.cluster_ip
+
+    client_pod = "arachne-e2e-dns-cli"
+    _delete_pods(core_v1, client_pod)
+    core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(client_pod, node_name))
+
+    try:
+        _wait_running_ip(core_v1, client_pod)
+
+        # Retry until the agent has programmed the kube-dns service/backends into
+        # the BPF maps; until then the ClusterIP is punted and the lookup fails.
+        def resolved():
+            out = _nslookup(core_v1, client_pod,
+                            "kubernetes.default.svc.cluster.local", dns_ip)
+            return out if expected_ip in out else None
+
+        out = _wait(resolved, timeout=60)
+        assert expected_ip in out, f"DNS reply missing {expected_ip}:\n{out}"
+    finally:
+        _delete_pods(core_v1, client_pod)
 
 
 # ── Conntrack GC ───────────────────────────────────────────────────────────────
