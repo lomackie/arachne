@@ -22,6 +22,24 @@ pub const COUNTER_SERVICE_SNAT: u32 = 5;
 pub const COUNTER_CT_EVICT: u32 = 6;
 pub const COUNTER_MAX: u32 = 7;
 
+// Per-flow TCP state bits, stored in `NatVal.state` and maintained by the
+// datapath. UDP flows leave these unset (the GC always treats UDP as short).
+//
+// EST     — traffic seen in both directions (the backend replied). Promoted on
+//           both halves so the GC can grant the long idle timeout from either.
+// FIN_FWD — a FIN crossed client→backend.
+// FIN_REV — a FIN crossed backend→client.
+//
+// The two FIN bits track the close handshake. Each side, on sending its FIN,
+// records it on the *partner* entry (so the other direction reads it locally
+// with no extra lookup). When the second FIN arrives, both bits are consolidated
+// onto whichever entry the final ACK will traverse, so that ACK — a non-FIN
+// packet seeing both bits — evicts the flow with a purely local read. The GC
+// also treats either FIN bit as "closing" and applies the short timeout.
+pub const CT_EST: u8 = 0x01;
+pub const CT_FIN_FWD: u8 = 0x02;
+pub const CT_FIN_REV: u8 = 0x04;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Endpoint {
@@ -98,12 +116,15 @@ unsafe impl aya::Pod for NatKey {}
 /// Rewritten address+port: used as new-dst in CT_DNAT and new-src in CT_SNAT.
 /// `last_seen` is `bpf_ktime_get_ns()` (CLOCK_MONOTONIC ns) at the most recent
 /// packet on the flow, refreshed by the datapath and read by the userspace GC.
+/// `state` is a bitset of the `CT_*` flags tracking the flow's TCP lifecycle,
+/// which the GC uses to pick a state-aware idle timeout.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NatVal {
     pub ip: u32,
     pub port: u16,
-    pub _pad: [u8; 2],
+    pub state: u8,
+    pub _pad: u8,
     pub last_seen: u64,
 }
 

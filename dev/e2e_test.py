@@ -475,12 +475,14 @@ def test_conntrack_gc_reaps_idle_flows(core_v1, apps_v1):
     client_pod = "arachne-e2e-gc-cli"
 
     # Aggressive timers so the test is fast: reap flows idle > 4s, sweep every 2s.
+    # UDP is state-aware "short", so drive the short timeout (not the established
+    # ARACHNE_CT_IDLE_SECS, which only applies to established TCP flows).
     _patch_agent_env(apps_v1, [
-        {"name": "ARACHNE_CT_IDLE_SECS", "value": "4"},
+        {"name": "ARACHNE_CT_SHORT_SECS", "value": "4"},
         {"name": "ARACHNE_CT_GC_SECS", "value": "2"},
     ])
     try:
-        _wait_agent_ready_with_env(core_v1, node_name, "ARACHNE_CT_IDLE_SECS", present=True)
+        _wait_agent_ready_with_env(core_v1, node_name, "ARACHNE_CT_SHORT_SECS", present=True)
 
         _delete_pods(core_v1, client_pod)
         core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(client_pod, node_name))
@@ -514,11 +516,79 @@ def test_conntrack_gc_reaps_idle_flows(core_v1, apps_v1):
         assert _wait(gc_evicted, timeout=40), "GC never reported an eviction"
     finally:
         _patch_agent_env(apps_v1, [
-            {"name": "ARACHNE_CT_IDLE_SECS", "$patch": "delete"},
+            {"name": "ARACHNE_CT_SHORT_SECS", "$patch": "delete"},
             {"name": "ARACHNE_CT_GC_SECS", "$patch": "delete"},
         ])
-        _wait_agent_ready_with_env(core_v1, node_name, "ARACHNE_CT_IDLE_SECS", present=False)
+        _wait_agent_ready_with_env(core_v1, node_name, "ARACHNE_CT_SHORT_SECS", present=False)
         _delete_pods(core_v1, client_pod)
+
+
+def _agent_ct_evict(core_v1, agent_name):
+    """Latest ct_evict counter value from the agent log, or None if not yet logged.
+
+    The agent prints a `counters: ... ct_evict=N` line every 30s. ct_evict is
+    bumped only by datapath teardown (RST/FIN) — the GC sweep never touches it —
+    so this is a clean signal that the datapath evicted a flow.
+    """
+    resp = core_v1.read_namespaced_pod_log(
+        agent_name, "kube-system", container="agent", tail_lines=300,
+        _preload_content=False,
+    )
+    logs = resp.data.decode("utf-8", "replace")
+    val = None
+    for line in logs.splitlines():
+        if line.startswith("counters:") and "ct_evict=" in line:
+            val = int(line.split("ct_evict=")[1].split()[0])
+    return val
+
+
+def test_conntrack_evicts_on_clean_tcp_close(core_v1):
+    """A cleanly closed TCP connection through a ClusterIP is torn down in the
+    datapath (the FIN handshake), not left for the idle GC sweep.
+
+    Each wget is a fresh connection the server closes cleanly (HTTP/1.0), so it
+    completes the FIN handshake rather than aborting with RST. The agent's
+    ct_evict counter is bumped only by datapath teardown, so a climb of one per
+    closed connection proves the FIN-eviction path fired without waiting on GC.
+    """
+    nodes = core_v1.list_node().items
+    workers = [n for n in nodes if "node-role.kubernetes.io/control-plane" not in (n.metadata.labels or {})]
+    node_name = workers[0].metadata.name
+
+    backend, client_pod, svc = "arachne-e2e-fin-be", "arachne-e2e-fin-cli", "arachne-e2e-fin"
+    _delete_pods(core_v1, backend, client_pod)
+    _delete_service(core_v1, svc)
+
+    core_v1.create_namespaced_pod(NAMESPACE, _httpd_pod(backend, node_name))
+    core_v1.create_namespaced_pod(NAMESPACE, _busybox_pod(client_pod, node_name))
+    created_svc = core_v1.create_namespaced_service(NAMESPACE, _service(svc))
+
+    try:
+        _wait_running_ip(core_v1, backend)
+        _wait_running_ip(core_v1, client_pod)
+
+        url = f"http://{created_svc.spec.cluster_ip}:80/"
+        # Retry until the service is programmed and actually routes to the backend.
+        resp = _wait_response_in(core_v1, client_pod, url, {backend})
+        assert resp == backend, f"expected {backend}, got {resp!r}"
+
+        agent = _agent_pod_on(core_v1, node_name)
+        # Baseline after the warm-up request above is already counted.
+        baseline = _wait(lambda: _agent_ct_evict(core_v1, agent.metadata.name), timeout=60)
+
+        bursts = 5
+        for _ in range(bursts):
+            assert _curl(core_v1, client_pod, url) == backend
+
+        def climbed():
+            cur = _agent_ct_evict(core_v1, agent.metadata.name)
+            return cur if cur is not None and cur >= baseline + bursts else None
+
+        assert _wait(climbed, timeout=90), \
+            f"ct_evict did not climb by {bursts} from baseline {baseline}"
+    finally:
+        _delete_pods(core_v1, backend, client_pod)
+        _delete_service(core_v1, svc)
 
 
 CLUSTER_NAME = "arachne-dev"

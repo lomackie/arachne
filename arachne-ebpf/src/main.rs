@@ -4,10 +4,10 @@
 use core::ffi::c_long;
 
 use arachne_common::{
-    BackendKey, BackendVal, COUNTER_CT_EVICT, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_MAX,
-    COUNTER_REDIRECT, COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT, COUNTER_SERVICE_SNAT, Endpoint,
-    MAX_BACKENDS, MAX_CT_ENTRIES, MAX_ENDPOINTS, MAX_SERVICES, NatKey, NatVal, ServiceKey,
-    ServiceVal, is_service_ip,
+    BackendKey, BackendVal, CT_EST, CT_FIN_FWD, CT_FIN_REV, COUNTER_CT_EVICT, COUNTER_FIB_MISS,
+    COUNTER_MAP_HIT, COUNTER_MAX, COUNTER_REDIRECT, COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT,
+    COUNTER_SERVICE_SNAT, Endpoint, MAX_BACKENDS, MAX_CT_ENTRIES, MAX_ENDPOINTS, MAX_SERVICES,
+    NatKey, NatVal, ServiceKey, ServiceVal, is_service_ip,
 };
 use aya_ebpf::{
     EbpfContext,
@@ -48,8 +48,9 @@ const AF_INET: u8 = 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-// TCP flags byte sits at offset 13 within the TCP header; RST is bit 2.
+// TCP flags byte sits at offset 13 within the TCP header; FIN is bit 0, RST bit 2.
 const TCP_FLAGS_OFF: usize = 13;
+const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 
 // Only rewrite a conntrack entry's last_seen if it's older than this, to avoid a
@@ -111,6 +112,7 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             0
         };
         let is_rst = tcp_flags & TCP_RST != 0;
+        let is_fin = ip_proto == IPPROTO_TCP && tcp_flags & TCP_FIN != 0;
         let now = unsafe { bpf_ktime_get_ns() };
 
         // Check CT_SNAT: return packet from a backend we previously DNAT'd to.
@@ -127,6 +129,7 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             let new_ip = unsafe { (*snat).ip };
             let new_port = unsafe { (*snat).port };
             let last_seen = unsafe { (*snat).last_seen };
+            let snat_state = unsafe { (*snat).state };
             if !is_rst && now.wrapping_sub(last_seen) > CT_REFRESH_NS {
                 unsafe { (*snat).last_seen = now };
             }
@@ -145,20 +148,53 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
 
             bump(COUNTER_SERVICE_SNAT);
 
+            // The forward (CT_DNAT) key mirrors this reverse flow: the client is
+            // this packet's dst, the VIP is the value we just read.
+            let dnat_key = NatKey {
+                src_ip: ip_dst,
+                dst_ip: new_ip,
+                src_port: dst_port,
+                dst_port: new_port,
+                proto: ip_proto,
+                _pad: [0; 3],
+            };
             if is_rst {
-                // Tear down both halves. The forward key is the mirror: the client
-                // is this packet's dst, the VIP is the value we just read.
+                // Tear down both halves immediately on an abort.
                 let _ = CT_SNAT.remove(&snat_key);
-                let dnat_key = NatKey {
-                    src_ip: ip_dst,
-                    dst_ip: new_ip,
-                    src_port: dst_port,
-                    dst_port: new_port,
-                    proto: ip_proto,
-                    _pad: [0; 3],
-                };
                 let _ = CT_DNAT.remove(&dnat_key);
                 bump(COUNTER_CT_EVICT);
+            } else if ip_proto == IPPROTO_TCP && is_fin {
+                // Backend's FIN (reverse direction). Record it on the *forward*
+                // entry, where the client's path will read it. If the client has
+                // already FIN'd (its bit is on our own entry), both sides are now
+                // closed: consolidate both bits onto the forward entry, which is
+                // the one the final ACK will traverse — so that ACK evicts locally.
+                if let Some(dp) = unsafe { CT_DNAT.get_ptr_mut(&dnat_key) } {
+                    if snat_state & CT_FIN_FWD != 0 {
+                        unsafe { (*dp).state |= CT_FIN_FWD | CT_FIN_REV };
+                    } else {
+                        unsafe { (*dp).state |= CT_FIN_REV };
+                    }
+                }
+            } else if ip_proto == IPPROTO_TCP
+                && snat_state & CT_FIN_FWD != 0
+                && snat_state & CT_FIN_REV != 0
+            {
+                // Non-FIN packet and both bits are set on our own entry: this is
+                // the final ACK of a backend-closed-first teardown. Evict both.
+                let _ = CT_DNAT.remove(&dnat_key);
+                let _ = CT_SNAT.remove(&snat_key);
+                bump(COUNTER_CT_EVICT);
+            } else if snat_state & CT_EST == 0 {
+                // First reply from the backend — traffic now flows both ways, so
+                // mark the flow ESTABLISHED on both halves. The GC reads this to
+                // grant a long idle timeout (vs. the short one for half-open/UDP).
+                if let Some(dp) = unsafe { CT_DNAT.get_ptr_mut(&dnat_key) } {
+                    unsafe { (*dp).state |= CT_EST };
+                }
+                if let Some(sp) = unsafe { CT_SNAT.get_ptr_mut(&snat_key) } {
+                    unsafe { (*sp).state |= CT_EST };
+                }
             }
             // ip_dst is the original destination (client pod); forward normally.
         } else if is_service_ip(ip_dst) {
@@ -172,15 +208,16 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
                 _pad: [0; 3],
             };
 
-            let (new_dst_ip, new_dst_port) =
+            let (new_dst_ip, new_dst_port, dnat_state) =
                 if let Some(cached) = unsafe { CT_DNAT.get_ptr_mut(&dnat_key) } {
                     let ip = unsafe { (*cached).ip };
                     let port = unsafe { (*cached).port };
                     let last_seen = unsafe { (*cached).last_seen };
+                    let state = unsafe { (*cached).state };
                     if !is_rst && now.wrapping_sub(last_seen) > CT_REFRESH_NS {
                         unsafe { (*cached).last_seen = now };
                     }
-                    (ip, port)
+                    (ip, port, state)
                 } else {
                     // First packet of this flow: look up service and pick a backend.
                     let svc_key = ServiceKey { vip: ip_dst, port: dst_port, proto: ip_proto, _pad: 0 };
@@ -209,7 +246,8 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
                     // Cache the forward DNAT decision for subsequent packets. A full
                     // table means we can't track the flow: punt to the kernel rather
                     // than DNAT uncached (which would re-pick a backend every packet).
-                    let fwd = NatVal { ip: pod_ip, port: pod_port, _pad: [0; 2], last_seen: now };
+                    let fwd =
+                        NatVal { ip: pod_ip, port: pod_port, state: 0, _pad: 0, last_seen: now };
                     if CT_DNAT.insert(&dnat_key, &fwd, 0).is_err() {
                         bump(COUNTER_SERVICE_PUNT);
                         return Ok(TC_ACT_OK as i32);
@@ -224,14 +262,15 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
                         proto: ip_proto,
                         _pad: [0; 3],
                     };
-                    let rev = NatVal { ip: ip_dst, port: dst_port, _pad: [0; 2], last_seen: now };
+                    let rev =
+                        NatVal { ip: ip_dst, port: dst_port, state: 0, _pad: 0, last_seen: now };
                     if CT_SNAT.insert(&snat_rev, &rev, 0).is_err() {
                         let _ = CT_DNAT.remove(&dnat_key);
                         bump(COUNTER_SERVICE_PUNT);
                         return Ok(TC_ACT_OK as i32);
                     }
 
-                    (pod_ip, pod_port)
+                    (pod_ip, pod_port, 0)
                 };
 
             // DNAT: rewrite dst IP and dst port, update checksums.
@@ -248,18 +287,41 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
 
             bump(COUNTER_SERVICE_DNAT);
 
+            // The reverse (CT_SNAT) key mirrors the forward flow: the backend we
+            // just DNAT'd to is the src, the client is the dst.
+            let snat_rev = NatKey {
+                src_ip: new_dst_ip,
+                dst_ip: ip_src,
+                src_port: new_dst_port,
+                dst_port: src_port,
+                proto: ip_proto,
+                _pad: [0; 3],
+            };
             if is_rst {
-                // Tear down both halves. The reverse key mirrors the forward flow:
-                // the backend we just DNAT'd to is the src, the client is the dst.
+                // Tear down both halves immediately on an abort.
                 let _ = CT_DNAT.remove(&dnat_key);
-                let snat_rev = NatKey {
-                    src_ip: new_dst_ip,
-                    dst_ip: ip_src,
-                    src_port: new_dst_port,
-                    dst_port: src_port,
-                    proto: ip_proto,
-                    _pad: [0; 3],
-                };
+                let _ = CT_SNAT.remove(&snat_rev);
+                bump(COUNTER_CT_EVICT);
+            } else if ip_proto == IPPROTO_TCP && is_fin {
+                // Client's FIN (forward direction). Record it on the *reverse*
+                // entry, where the backend's path will read it. If the backend has
+                // already FIN'd (its bit is on our own entry), both sides are now
+                // closed: consolidate both bits onto the reverse entry, which is
+                // the one the final ACK will traverse — so that ACK evicts locally.
+                if let Some(sp) = unsafe { CT_SNAT.get_ptr_mut(&snat_rev) } {
+                    if dnat_state & CT_FIN_REV != 0 {
+                        unsafe { (*sp).state |= CT_FIN_FWD | CT_FIN_REV };
+                    } else {
+                        unsafe { (*sp).state |= CT_FIN_FWD };
+                    }
+                }
+            } else if ip_proto == IPPROTO_TCP
+                && dnat_state & CT_FIN_FWD != 0
+                && dnat_state & CT_FIN_REV != 0
+            {
+                // Non-FIN packet and both bits are set on our own entry: this is
+                // the final ACK of a client-closed-first teardown. Evict both.
+                let _ = CT_DNAT.remove(&dnat_key);
                 let _ = CT_SNAT.remove(&snat_rev);
                 bump(COUNTER_CT_EVICT);
             }

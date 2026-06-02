@@ -11,12 +11,15 @@ use anyhow::Result;
 use nix::mount::MsFlags;
 
 use arachne_common::{
-    BackendKey, BackendVal, COUNTER_CT_EVICT, COUNTER_FIB_MISS, COUNTER_MAP_HIT, COUNTER_REDIRECT,
-    COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT, COUNTER_SERVICE_SNAT, Endpoint,
-    BACKENDS_MAP, CT_DNAT_MAP, CT_SNAT_MAP, ENDPOINTS_MAP, NatKey, NatVal, SERVICES_MAP,
-    ServiceKey, ServiceVal, endpoint_key,
+    BackendKey, BackendVal, CT_EST, CT_FIN_FWD, CT_FIN_REV, COUNTER_CT_EVICT, COUNTER_FIB_MISS,
+    COUNTER_MAP_HIT, COUNTER_REDIRECT, COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT,
+    COUNTER_SERVICE_SNAT, Endpoint, BACKENDS_MAP, CT_DNAT_MAP, CT_SNAT_MAP, ENDPOINTS_MAP, NatKey,
+    NatVal, SERVICES_MAP, ServiceKey, ServiceVal, endpoint_key,
 };
 use crate::cni::CniError;
+
+// IP protocol number for TCP, used to pick a state-aware conntrack timeout.
+const IPPROTO_TCP: u8 = 6;
 
 static EBPF_BYTES: &[u8] = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/arachne-ebpf"));
 
@@ -211,6 +214,30 @@ fn monotonic_ns() -> Result<u64> {
     Ok(ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64)
 }
 
+/// State-aware conntrack idle timeouts, in nanoseconds (the unit the datapath
+/// stamps `last_seen` with via `bpf_ktime_get_ns()`).
+#[derive(Clone, Copy)]
+pub struct CtTimeouts {
+    pub established_ns: u64,
+    pub short_ns: u64,
+}
+
+impl CtTimeouts {
+    /// The idle limit for a flow, chosen from its protocol and TCP state. Only an
+    /// established, non-closing TCP flow gets the long timeout; half-open TCP
+    /// (no reply yet), closing TCP (a FIN has been seen on either side), and all
+    /// UDP age out on the short one — matching how real conntrack keeps
+    /// ESTABLISHED for a long while but reaps the rest quickly.
+    fn idle_limit(&self, proto: u8, state: u8) -> u64 {
+        let closing = state & (CT_FIN_FWD | CT_FIN_REV) != 0;
+        if proto == IPPROTO_TCP && state & CT_EST != 0 && !closing {
+            self.established_ns
+        } else {
+            self.short_ns
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct CtGcStats {
     /// Conntrack entries examined across both maps.
@@ -219,12 +246,12 @@ pub struct CtGcStats {
     pub evicted: u64,
 }
 
-/// Sweep the conntrack maps and delete flows idle for longer than `idle_ns`.
+/// Sweep the conntrack maps and delete flows idle past their state-aware timeout.
 ///
 /// Each flow occupies a forward (CT_DNAT) + reverse (CT_SNAT) entry. When either
 /// half is stale we delete both — reconstructing the partner key from the entry's
 /// value — so the two maps can never be left half-populated.
-pub fn ct_gc(idle_ns: u64) -> Result<CtGcStats> {
+pub fn ct_gc(timeouts: CtTimeouts) -> Result<CtGcStats> {
     let now = monotonic_ns()?;
     let mut dnat = open_ct_map(CT_DNAT_MAP)?;
     let mut snat = open_ct_map(CT_SNAT_MAP)?;
@@ -235,7 +262,7 @@ pub fn ct_gc(idle_ns: u64) -> Result<CtGcStats> {
     for k in dnat_keys {
         stats.scanned += 1;
         let Ok(v) = dnat.get(&k, 0) else { continue };
-        if now.saturating_sub(v.last_seen) <= idle_ns {
+        if now.saturating_sub(v.last_seen) <= timeouts.idle_limit(k.proto, v.state) {
             continue;
         }
         let _ = dnat.remove(&k);
@@ -258,7 +285,7 @@ pub fn ct_gc(idle_ns: u64) -> Result<CtGcStats> {
     for k in snat_keys {
         stats.scanned += 1;
         let Ok(v) = snat.get(&k, 0) else { continue };
-        if now.saturating_sub(v.last_seen) <= idle_ns {
+        if now.saturating_sub(v.last_seen) <= timeouts.idle_limit(k.proto, v.state) {
             continue;
         }
         let _ = snat.remove(&k);

@@ -35,7 +35,7 @@ pub async fn run() -> Result<()> {
     let mut counter_tick = tokio::time::interval(Duration::from_secs(30));
     counter_tick.tick().await;
 
-    let ct_idle = conntrack::idle_timeout();
+    let ct_timeouts = conntrack::timeouts();
     let mut gc_tick = tokio::time::interval(conntrack::gc_interval());
     gc_tick.tick().await;
 
@@ -58,7 +58,7 @@ pub async fn run() -> Result<()> {
                 }
             }
             _ = gc_tick.tick() => {
-                conntrack::gc_tick(ct_idle);
+                conntrack::gc_tick(ct_timeouts);
             }
         }
     }
