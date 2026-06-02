@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -133,6 +134,43 @@ pub fn endpoints_remove(pod_ip: Ipv4Addr) -> Result<(), CniError> {
     let mut map = open_endpoints_map()?;
     map.remove(&endpoint_key(pod_ip))
         .map_err(|e| CniError::Netlink(format!("remove ENDPOINTS entry: {e}")))
+}
+
+#[derive(Default)]
+pub struct EndpointGcStats {
+    /// ENDPOINTS entries examined.
+    pub scanned: u64,
+    /// Stale entries removed.
+    pub removed: u64,
+}
+
+/// Sweep the pinned ENDPOINTS map and drop entries that no longer back a live
+/// pod. Pinned maps survive agent/plugin restarts, so a pod that crashed (its
+/// CNI DEL never ran) leaks an entry. An entry is stale when its pod IP is
+/// absent from the IPAM store (`allocated`) or its host-side veth ifindex no
+/// longer exists (`live_ifindexes`). The CNI plugin writes the IPAM record
+/// before the ENDPOINTS entry on ADD, so a freshly-added pod is never seen as
+/// stale by a concurrent sweep — the GC only ever removes, never resurrects.
+pub fn endpoints_gc(
+    allocated: &HashSet<Ipv4Addr>,
+    live_ifindexes: &HashSet<u32>,
+) -> Result<EndpointGcStats, CniError> {
+    let mut map = open_endpoints_map()?;
+    let mut stats = EndpointGcStats::default();
+
+    let keys: Vec<u32> = map.keys().filter_map(Result::ok).collect();
+    for key in keys {
+        stats.scanned += 1;
+        let Ok(endpoint) = map.get(&key, 0) else { continue };
+        let ip = Ipv4Addr::from(key.to_le_bytes());
+        if allocated.contains(&ip) && live_ifindexes.contains(&endpoint.ifindex) {
+            continue;
+        }
+        let _ = map.remove(&key);
+        stats.removed += 1;
+    }
+
+    Ok(stats)
 }
 
 pub fn services_upsert(key: ServiceKey, val: ServiceVal) -> Result<()> {

@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use ipnet::IpNet;
 use super::error::CniError;
@@ -27,6 +28,31 @@ pub fn lookup(container_id: &str) -> Result<Option<IpAddr>, CniError> {
 
 pub fn release(container_id: &str) -> Result<(), CniError> {
     release_in(Path::new(DATA_DIR), container_id)
+}
+
+/// The set of pod IPs currently allocated, read from the `by-ip/` store. The
+/// agent's ENDPOINTS GC treats this as the source of truth for which entries
+/// still back a live pod. A missing store (no pod has ever landed) is an empty
+/// set, not an error.
+pub fn allocated_ips() -> Result<HashSet<Ipv4Addr>, CniError> {
+    allocated_ips_in(Path::new(DATA_DIR))
+}
+
+fn allocated_ips_in(root: &Path) -> Result<HashSet<Ipv4Addr>, CniError> {
+    let by_ip = root.join("by-ip");
+    let entries = match std::fs::read_dir(&by_ip) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(CniError::Io(e)),
+    };
+    let mut ips = HashSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(ip) = entry.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) {
+            ips.insert(ip);
+        }
+    }
+    Ok(ips)
 }
 
 fn allocate_in(root: &Path, net: &IpNet, container_id: &str) -> Result<Allocation, CniError> {
@@ -116,5 +142,26 @@ mod tests {
 
         let b = allocate_in(dir.path(), &net, "container-b").unwrap();
         assert_eq!(b.address, a.address);
+    }
+
+    #[test]
+    fn allocated_ips_reflects_by_ip_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = IpNet::from_str("10.244.1.0/24").unwrap();
+
+        // No store yet -> empty, not an error.
+        assert!(allocated_ips_in(dir.path()).unwrap().is_empty());
+
+        allocate_in(dir.path(), &net, "container-a").unwrap();
+        allocate_in(dir.path(), &net, "container-b").unwrap();
+        let ips = allocated_ips_in(dir.path()).unwrap();
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&Ipv4Addr::new(10, 244, 1, 2)));
+        assert!(ips.contains(&Ipv4Addr::new(10, 244, 1, 3)));
+
+        release_in(dir.path(), "container-a").unwrap();
+        let ips = allocated_ips_in(dir.path()).unwrap();
+        assert_eq!(ips.len(), 1);
+        assert!(ips.contains(&Ipv4Addr::new(10, 244, 1, 3)));
     }
 }

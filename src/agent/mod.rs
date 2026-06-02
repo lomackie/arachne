@@ -1,4 +1,5 @@
 mod conntrack;
+mod endpoints;
 mod routes;
 mod services;
 mod startup;
@@ -23,6 +24,10 @@ pub async fn run() -> Result<()> {
     crate::bpf::ensure_bpffs().context("failed to mount bpffs")?;
     crate::bpf::attach_node("eth0").context("failed to attach TC to eth0")?;
     write_conflist(&pod_cidr).context("failed to write conflist")?;
+
+    // Attaching the node program pins the ENDPOINTS map, so it is open by now.
+    // Sweep entries leaked by pods that died without a CNI DEL before serving.
+    endpoints::reconcile();
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
