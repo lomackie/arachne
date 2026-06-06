@@ -5,8 +5,7 @@ use core::net::Ipv4Addr;
 pub const ENDPOINTS_MAP: &str = "ENDPOINTS";
 pub const SERVICES_MAP: &str = "SERVICES";
 pub const BACKENDS_MAP: &str = "BACKENDS";
-pub const CT_DNAT_MAP: &str = "CT_DNAT";
-pub const CT_SNAT_MAP: &str = "CT_SNAT";
+pub const CONNTRACK_MAP: &str = "CONNTRACK";
 
 pub const MAX_ENDPOINTS: u32 = 1 << 16;
 pub const MAX_SERVICES: u32 = 4096;
@@ -98,7 +97,9 @@ pub struct BackendVal {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for BackendVal {}
 
-/// 5-tuple key for the conntrack maps (CT_DNAT, CT_SNAT).
+/// 5-tuple key for the conntrack map (CONNTRACK). Both directions of a flow are
+/// stored under their own key: the forward (client→svc) and reverse
+/// (backend→client) tuples are distinct, so they never collide in the one map.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NatKey {
@@ -113,7 +114,11 @@ pub struct NatKey {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for NatKey {}
 
-/// Rewritten address+port: used as new-dst in CT_DNAT and new-src in CT_SNAT.
+/// Rewritten address+port plus a link to the flow's other half. On the forward
+/// entry `ip`/`port` are the DNAT new-dst (the backend); on the reverse entry
+/// they are the SNAT new-src (the VIP). `partner` is the other direction's
+/// `NatKey`, written at insert time, so eviction and GC delete both halves with
+/// a direct read instead of reconstructing the partner tuple from this value.
 /// `last_seen` is `bpf_ktime_get_ns()` (CLOCK_MONOTONIC ns) at the most recent
 /// packet on the flow, refreshed by the datapath and read by the userspace GC.
 /// `state` is a bitset of the `CT_*` flags tracking the flow's TCP lifecycle,
@@ -126,6 +131,7 @@ pub struct NatVal {
     pub state: u8,
     pub _pad: u8,
     pub last_seen: u64,
+    pub partner: NatKey,
 }
 
 #[cfg(feature = "user")]
@@ -167,7 +173,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<BackendKey>(), 8);
         assert_eq!(core::mem::size_of::<BackendVal>(), 8);
         assert_eq!(core::mem::size_of::<NatKey>(), 16);
-        assert_eq!(core::mem::size_of::<NatVal>(), 16);
+        assert_eq!(core::mem::size_of::<NatVal>(), 32);
     }
 
     #[test]

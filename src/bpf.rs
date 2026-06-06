@@ -13,7 +13,7 @@ use nix::mount::MsFlags;
 use arachne_common::{
     BackendKey, BackendVal, CT_EST, CT_FIN_FWD, CT_FIN_REV, COUNTER_CT_EVICT, COUNTER_FIB_MISS,
     COUNTER_MAP_HIT, COUNTER_REDIRECT, COUNTER_SERVICE_DNAT, COUNTER_SERVICE_PUNT,
-    COUNTER_SERVICE_SNAT, Endpoint, BACKENDS_MAP, CT_DNAT_MAP, CT_SNAT_MAP, ENDPOINTS_MAP, NatKey,
+    COUNTER_SERVICE_SNAT, Endpoint, BACKENDS_MAP, CONNTRACK_MAP, ENDPOINTS_MAP, NatKey,
     NatVal, SERVICES_MAP, ServiceKey, ServiceVal, endpoint_key,
 };
 use crate::cni::CniError;
@@ -198,12 +198,12 @@ pub fn backends_upsert(key: BackendKey, val: BackendVal) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("insert BACKENDS entry: {e}"))
 }
 
-fn open_ct_map(name: &str) -> Result<HashMap<MapData, NatKey, NatVal>> {
-    let path = format!("{PIN_DIR}/{name}");
+fn open_ct_map() -> Result<HashMap<MapData, NatKey, NatVal>> {
+    let path = format!("{PIN_DIR}/{CONNTRACK_MAP}");
     let map_data = MapData::from_pin(&path)
-        .map_err(|e| anyhow::anyhow!("open {name} map: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("open {CONNTRACK_MAP} map: {e}"))?;
     HashMap::try_from(Map::HashMap(map_data))
-        .map_err(|e| anyhow::anyhow!("open {name} map: {e}"))
+        .map_err(|e| anyhow::anyhow!("open {CONNTRACK_MAP} map: {e}"))
 }
 
 /// CLOCK_MONOTONIC nanoseconds — the same clock the datapath stamps entries with
@@ -240,65 +240,35 @@ impl CtTimeouts {
 
 #[derive(Default)]
 pub struct CtGcStats {
-    /// Conntrack entries examined across both maps.
+    /// Conntrack entries examined.
     pub scanned: u64,
     /// Flows evicted (each removes a forward + reverse pair).
     pub evicted: u64,
 }
 
-/// Sweep the conntrack maps and delete flows idle past their state-aware timeout.
+/// Sweep the conntrack map and delete flows idle past their state-aware timeout.
 ///
-/// Each flow occupies a forward (CT_DNAT) + reverse (CT_SNAT) entry. When either
-/// half is stale we delete both — reconstructing the partner key from the entry's
-/// value — so the two maps can never be left half-populated.
+/// Each flow occupies a forward + reverse entry in the one map, and each entry's
+/// value carries its partner's key. When an entry is stale we delete it and its
+/// partner via the stored key — no tuple reconstruction — so a flow is never left
+/// half-populated. The partner is removed even if itself fresh: a flow is a unit.
+/// The partner of an already-evicted flow is simply a missing-key remove (no-op),
+/// and its own iteration turn finds nothing to get, so no flow is double-counted.
 pub fn ct_gc(timeouts: CtTimeouts) -> Result<CtGcStats> {
     let now = monotonic_ns()?;
-    let mut dnat = open_ct_map(CT_DNAT_MAP)?;
-    let mut snat = open_ct_map(CT_SNAT_MAP)?;
+    let mut ct = open_ct_map()?;
     let mut stats = CtGcStats::default();
 
-    // Forward sweep: CT_DNAT key = (client→vip), value = (backend ip/port).
-    let dnat_keys: Vec<NatKey> = dnat.keys().filter_map(Result::ok).collect();
-    for k in dnat_keys {
+    let keys: Vec<NatKey> = ct.keys().filter_map(Result::ok).collect();
+    for k in keys {
         stats.scanned += 1;
-        let Ok(v) = dnat.get(&k, 0) else { continue };
+        // Already removed as some earlier-evicted flow's partner.
+        let Ok(v) = ct.get(&k, 0) else { continue };
         if now.saturating_sub(v.last_seen) <= timeouts.idle_limit(k.proto, v.state) {
             continue;
         }
-        let _ = dnat.remove(&k);
-        // Reverse partner: (backend→client).
-        let partner = NatKey {
-            src_ip: v.ip,
-            dst_ip: k.src_ip,
-            src_port: v.port,
-            dst_port: k.src_port,
-            proto: k.proto,
-            _pad: [0; 3],
-        };
-        let _ = snat.remove(&partner);
-        stats.evicted += 1;
-    }
-
-    // Reverse sweep: catch CT_SNAT entries whose partner was already gone, or
-    // that aged out independently. CT_SNAT key = (backend→client), value = vip.
-    let snat_keys: Vec<NatKey> = snat.keys().filter_map(Result::ok).collect();
-    for k in snat_keys {
-        stats.scanned += 1;
-        let Ok(v) = snat.get(&k, 0) else { continue };
-        if now.saturating_sub(v.last_seen) <= timeouts.idle_limit(k.proto, v.state) {
-            continue;
-        }
-        let _ = snat.remove(&k);
-        // Forward partner: (client→vip).
-        let partner = NatKey {
-            src_ip: k.dst_ip,
-            dst_ip: v.ip,
-            src_port: k.dst_port,
-            dst_port: v.port,
-            proto: k.proto,
-            _pad: [0; 3],
-        };
-        let _ = dnat.remove(&partner);
+        let _ = ct.remove(&k);
+        let _ = ct.remove(&v.partner);
         stats.evicted += 1;
     }
 
