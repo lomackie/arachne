@@ -116,6 +116,12 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
         let now = unsafe { bpf_ktime_get_ns() };
 
         // Check the reverse entry: return packet from a backend we DNAT'd to.
+        // Skip this for service-bound packets. Both directions now share one map,
+        // and the forward entry is keyed by (client→VIP) — the exact tuple a
+        // forward packet carries — so a reverse lookup on a service-bound packet
+        // would match the flow's *own* forward entry and wrongly SNAT the client's
+        // packet. A genuine return packet is always addressed to a pod IP (the
+        // client), never a service IP, so this gate can't hide a real SNAT hit.
         let snat_key = NatKey {
             src_ip: ip_src,
             dst_ip: ip_dst,
@@ -124,7 +130,12 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
             proto: ip_proto,
             _pad: [0; 3],
         };
-        if let Some(snat) = unsafe { CONNTRACK.get_ptr_mut(&snat_key) } {
+        let snat = if is_service_ip(ip_dst) {
+            None
+        } else {
+            unsafe { CONNTRACK.get_ptr_mut(&snat_key) }
+        };
+        if let Some(snat) = snat {
             // Copy values immediately before any further map operations.
             let new_ip = unsafe { (*snat).ip };
             let new_port = unsafe { (*snat).port };
