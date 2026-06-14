@@ -75,12 +75,20 @@ pub struct ServiceVal {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ServiceVal {}
 
-/// Key for the backend map: (service_id, slot index).
+/// Key for the backend map: (service_id, service port + proto, slot index).
+/// The port/proto are part of the key because a single service can expose
+/// several ports under one `service_id` (e.g. kube-dns: 53/UDP, 53/TCP,
+/// 9153/TCP). Without them every port would reuse the same `(service_id, index)`
+/// slots and the last port reconciled would clobber the others' backends.
+/// `port` is in the `port_key()` representation, matching `ServiceKey.port`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BackendKey {
     pub service_id: u32,
     pub index: u32,
+    pub port: u16,
+    pub proto: u8,
+    pub _pad: u8,
 }
 
 #[cfg(feature = "user")]
@@ -170,7 +178,7 @@ mod tests {
     fn service_key_layout() {
         assert_eq!(core::mem::size_of::<ServiceKey>(), 8);
         assert_eq!(core::mem::size_of::<ServiceVal>(), 8);
-        assert_eq!(core::mem::size_of::<BackendKey>(), 8);
+        assert_eq!(core::mem::size_of::<BackendKey>(), 12);
         assert_eq!(core::mem::size_of::<BackendVal>(), 8);
         assert_eq!(core::mem::size_of::<NatKey>(), 16);
         assert_eq!(core::mem::size_of::<NatVal>(), 32);

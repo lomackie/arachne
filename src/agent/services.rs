@@ -200,7 +200,13 @@ impl SvcState {
 
             for (i, b) in port_backends.iter().enumerate() {
                 crate::bpf::backends_upsert(
-                    BackendKey { service_id: svc.id, index: i as u32 },
+                    BackendKey {
+                        service_id: svc.id,
+                        index: i as u32,
+                        port: port_key(port.svc_port),
+                        proto: port.proto,
+                        _pad: 0,
+                    },
                     BackendVal {
                         pod_ip: endpoint_key(b.pod_ip),
                         pod_port: port_key(b.port),

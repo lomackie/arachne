@@ -240,7 +240,16 @@ fn try_forward(ctx: &mut TcContext) -> Result<i32, c_long> {
                     }
 
                     let idx = unsafe { bpf_get_prandom_u32() } % count;
-                    let bk_key = BackendKey { service_id: svc_id, index: idx };
+                    // Key by the service port+proto too: one service_id spans all
+                    // of a service's ports, so the slot must be namespaced by the
+                    // port this packet is for (matches the SERVICES lookup above).
+                    let bk_key = BackendKey {
+                        service_id: svc_id,
+                        index: idx,
+                        port: dst_port,
+                        proto: ip_proto,
+                        _pad: 0,
+                    };
                     let Some(bk) = (unsafe { BACKENDS.get(&bk_key) }) else {
                         bump(COUNTER_SERVICE_PUNT);
                         return Ok(TC_ACT_OK as i32);
